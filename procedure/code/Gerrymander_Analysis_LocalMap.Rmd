@@ -73,7 +73,7 @@ if (!require(groundhog)) {
 
 # this date will be used to determine the versions of R and your packages
 # it is best practice to keep R and its packages up to date
-groundhog.day <- "2026-06-01"
+groundhog.day <- "2025-02-01"
 
 
 # this replaces any library() or require() calls
@@ -281,29 +281,6 @@ blkgrp_black_map +
   districtsmap
 ```
 
-### Precincts
-
-```{r}
-yr2020 = FALSE
-
-st_geometry(precincts) <- "geom"
-
-if (yr2020) {
-  precincts <- precincts |> mutate(
-  totV = G20PRERTRU + G20PREDBID,
-  mpV = G20PREDBID)
-} else {
-  precincts <- precincts |> mutate(
-  totV = G24PRERTRU + G24PREDHAR,
-  mpV = G24PREDHAR)
-}
-
-precincts <- precincts |> 
-  st_make_valid() |> 
-  st_transform(4269) |> 
-  mutate(sarea = st_area(geom))
-```
-
 ## Analysis
 
 Estimate the white and black voting age populations using AWR with block groups.
@@ -394,33 +371,48 @@ districts_results <- districts_join |>
   )
 ```
 
+When the fragment is inside of its district, the chRatio is the Cdiff of the district.  
+When the fragment is outside of its district (in the convex hull area), the chRatio is the Cdiff of the convex hull's district.
+
 
 ```{r wasted-votes}
 districts_results_table <- districts_results |> st_drop_geometry() |> 
   select(DISTRICT, chDiff)
 
+# join cDiff from district back to the fragment
 ch_frags <- d_ch_frag |> 
-  left_join(districts_results_table, by="DISTRICT") |> 
+  left_join(districts_results_table, by="DISTRICT")
+
+# will need the cDiff of the convex hull polygon as well
+districts_results_table <- districts_results_table |> 
+  select(DISTRICT, ch_hull_Diff = chDiff)
+
+ch_frags <- ch_frags |> 
+  left_join(districts_results_table, by=c("chDISTRICT" = "DISTRICT")) |> 
   mutate(minorRatio = awMinor / awTot,
-         chRatio = chDiff / 100,
+         chRatio = case_when(
+           DISTRICT == chDISTRICT ~ chDiff / 100,
+           DISTRICT != chDISTRICT ~ ch_hull_Diff / 100,
+           .default = 0),
          gerry = case_when(
-           chDiff > 0 & minorRatio - chRatio > 0 & DISTRICT == chDISTRICT ~ (minorRatio - chRatio) * awTot,
-           chDiff < 0 & minorRatio + chRatio > 0 & DISTRICT != chDISTRICT ~ (chRatio - minorRatio) * awTot,
+           chRatio > 0 & minorRatio - chRatio > 0 & DISTRICT == chDISTRICT ~ (minorRatio - chRatio) * awTot,
+           chRatio < 0 & minorRatio + chRatio > 0 & DISTRICT != chDISTRICT ~ (chRatio + minorRatio) * awTot,
            .default = 0
          ),
-         gerryPortion = gerry / awMinor
+         gerryPortionMinor = gerry / awMinor,
+         gerryProportionTotal = gerry / awTot
          )
 ```
 
 
 
 ```{r wasted-viz}
-tmap_mode(mode = "plot")
+tmap_mode(mode = "view")
 
-ch_frags |> filter(gerry > 0) |> 
+ch_frags |> dplyr::filter(gerry > 0) |> 
  tm_shape() + 
   tm_polygons(
-    fill = "gerryPortion",
+    fill = "gerryPortionMinor",
     col_alpha = 0.2,
     lwd = 0.1,
     col = "grey90"
@@ -429,6 +421,11 @@ tm_shape(districts) +
   tm_polygons(fill_alpha = 0,
               col = "red")
 
+```
+
+```{r}
+ch_frags |> dplyr::filter(gerry > 0) |> 
+  st_write(here("data", "derived", "public", result_set, "ch_gerry_frags.gpkg"))
 ```
 
 

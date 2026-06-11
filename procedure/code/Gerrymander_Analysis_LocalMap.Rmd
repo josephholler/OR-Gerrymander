@@ -425,7 +425,8 @@ tm_shape(districts) +
 
 ```{r}
 ch_frags |> dplyr::filter(gerry > 0) |> 
-  st_write(here("data", "derived", "public", result_set, "ch_gerry_frags.gpkg"))
+  st_write(here("data", "derived", "public", result_set, "ch_gerry_frags.gpkg"),
+           append=FALSE)
 ```
 
 

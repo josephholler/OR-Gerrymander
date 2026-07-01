@@ -73,7 +73,7 @@ if (!require(groundhog)) {
 
 # this date will be used to determine the versions of R and your packages
 # it is best practice to keep R and its packages up to date
-groundhog.day <- "2025-02-01"
+groundhog.day <- "2026-06-01"
 
 
 # this replaces any library() or require() calls
@@ -234,7 +234,9 @@ Next, calculate new columns.
 `Black` is a sum of all 32 columns shown above, in which any of the racial categories by which someone identifies is Black or African American.  
 `Total` is a copy of the population 18 years or over, variable `P3_001N`.  
 `pctMinority` is calculated as `Black / Total * 100`  
-`CheckPct` is calculated as the percentage of the population 18 years or older that is either white of one race only (`P3_003N`) *or* Black or African American as calculated above. In Alabama, we can expect that this will be close to 100% for most block groups, and should never exceed 100%.
+`CheckPct` is calculated as the percentage of the population 18 years or older that is either white of one race only (`P3_003N`) *or* Black or African American as calculated above. In Alabama and Louisiana, we can expect that this will be close to 100% for most block groups, and should never exceed 100%.
+
+**Note:** To scale for the whole United States, or any state for which it is important to calculate multiple minority groups, it may be wiser to simplify the calculation and avoid double-counting people by focusing on people identifying as only one race.
 
 ```{r}
 blockgroups_calc <- blockgroups 
@@ -273,7 +275,9 @@ blkgrp_black_map <- tm_shape(blockgroups_calc) +
 
 blkgrp_black_map
 ```
-Make an interactive map of the 2021 districts over the black population 
+Make an interactive map of the 2021 districts over the black population.
+
+**NOTE:** There is currently a bug in the choropleth classification in view mode. Everything is displaying as neutral blue.
 
 ```{r warning=FALSE}
 tmap_mode(mode = "view")
@@ -292,6 +296,12 @@ It turns out that R optimizes the *first* dataset in a spatial query or overlay,
 Therefore, add the more complex data to `st_intersection` first, and you'll see remarkably different run times.
 
 Spatial indices in R: https://r-spatial.org/r/2017/06/22/spatial-index.html
+
+- `race_fragments` are the intersection between Block Groups and Districts.
+- `district_estimates` are tabular results by district
+- `districts_join` are tabular results joined to the district polygons
+
+### District Composition
 
 ```{r warning=FALSE}
 race_fragments <- st_intersection(blockgroups_calc, districts) |> 
@@ -323,6 +333,13 @@ areal interpolation with block group data.
 districts_join |> st_drop_geometry() |> kable()
 ```
 
+### Convex Hulls of Districts and their Composition
+
+- `d_ch`: convex hulls
+- `d_ch_frag`: fragments from overlay of convex hulls with block groups
+- `d_ch_est`: district-level summary table of convex hull composition
+
+NOTE: Filter fragments for polygons, not just valid geometries!
 
 ```{r convex_hull_race warning=FALSE}
 d_ch <- districts |> 
@@ -346,13 +363,19 @@ d_ch_est <- d_ch_frag |>
             chMinority = sum(awMinor, na.rm = TRUE))
 ```
 
+### District Compactness and CDiff
+
 Join convex hull estimates to Districts with block group estimates.
+
+Calculate Cdiff scores
+
+- `chDiff` is the District composition - the Convex Hull composition
+- `ChAbsDiff` is the absolute value of chDiff
 
 Calculate compactness scores based on:
 
 - the area and perimeter
 - the area and the area of the convex hull
-- the area and the area of the minimum bounding circle
 
 Note: 
 To knit, will we need to replace `st_perimeter()` with `st_length(st_cast(geom, "MULTILINESTRING"))`?
@@ -371,8 +394,19 @@ districts_results <- districts_join |>
   )
 ```
 
-When the fragment is inside of its district, the chRatio is the Cdiff of the district.  
-When the fragment is outside of its district (in the convex hull area), the chRatio is the Cdiff of the convex hull's district.
+
+### Local Gerrymandering Scores
+
+Calculate local gerrymandering scores by...
+
+- Join District-level chDiff data to the fragments
+- `minorRatio` is the local minority ratio of the fragment
+- `gerry_type` is the type of gerrymandering for the given fragment: `packing` when the fragment is inside of its district (`DISTRICT == chDISTRICT`) and `diluting` when he fragment is outside of its district (`DISTRICT != chDISTRICT`)
+- `chRatio` is the minority ratio of the relevant district or convex hull, which is the chDiff of the district for packing and the chDiff of the convex hull (`ch_hull_Diff`) for diluting
+- `gerry` is a local estimate of wasted minority votes due to gerrymandering. 
+
+EXPLAIN gerry
+CONFIRM the code still works when using the gerry_type variable
 
 
 ```{r wasted-votes}
@@ -383,20 +417,23 @@ districts_results_table <- districts_results |> st_drop_geometry() |>
 ch_frags <- d_ch_frag |> 
   left_join(districts_results_table, by="DISTRICT")
 
-# will need the cDiff of the convex hull polygon as well
+# will need the cDiff of the convex hull polygon as well: ch_hull_Diff
 districts_results_table <- districts_results_table |> 
   select(DISTRICT, ch_hull_Diff = chDiff)
 
 ch_frags <- ch_frags |> 
   left_join(districts_results_table, by=c("chDISTRICT" = "DISTRICT")) |> 
   mutate(minorRatio = awMinor / awTot,
+         gerry_type = case_when(
+           DISTRICT == chDISTRICT ~ "packing",
+           DISTRICT != chDISTRICT ~ "diluting",),
          chRatio = case_when(
-           DISTRICT == chDISTRICT ~ chDiff / 100,
-           DISTRICT != chDISTRICT ~ ch_hull_Diff / 100,
+           gerry_type == "packing" ~ chDiff / 100,
+           gerry_type == "diluting" ~ ch_hull_Diff / 100,
            .default = 0),
          gerry = case_when(
-           chRatio > 0 & minorRatio - chRatio > 0 & DISTRICT == chDISTRICT ~ (minorRatio - chRatio) * awTot,
-           chRatio < 0 & minorRatio + chRatio > 0 & DISTRICT != chDISTRICT ~ (chRatio + minorRatio) * awTot,
+           gerry_type == "packing" & chRatio > 0 & minorRatio - chRatio > 0 ~ (minorRatio - chRatio) * awTot,
+           gerry_type == "diluting" & chRatio < 0 & minorRatio + chRatio > 0 ~ (chRatio + minorRatio) * awTot,
            .default = 0
          ),
          gerryPortionMinor = gerry / awMinor,
@@ -405,9 +442,8 @@ ch_frags <- ch_frags |>
 ```
 
 
-
 ```{r wasted-viz}
-tmap_mode(mode = "view")
+tmap_mode(mode = "plot")
 
 ch_frags |> dplyr::filter(gerry > 0) |> 
  tm_shape() + 
@@ -428,6 +464,11 @@ ch_frags |> dplyr::filter(gerry > 0) |>
   st_write(here("data", "derived", "public", result_set, "ch_gerry_frags.gpkg"),
            append=FALSE)
 ```
+
+
+### Centroids and Dot Density
+
+- are the geometries valid?  QGIS didn't think so, but st_make_valid has been applied?
 
 
 ```{r}

@@ -529,7 +529,7 @@ race_fragment_distances <- race_fragment_distances |>
                                 by_element = TRUE))
 ```
 
-Visualize distance from weighted population center
+Visualize distance from each district weighted population center to the locations in that district.
 
 ```{r}
 dist <- race_fragment_distances |> st_drop_geometry() |> 
@@ -579,6 +579,12 @@ compact_pop_center_districts |> st_buffer(0.0000001) |> st_buffer(-0.0000001) |>
   tm_polygons(fill = "District_Number",
               fill_alpha = 0.3)
 ```
+
+# NEXT
+
+## Calculate Cdiff based on cpc Districts
+
+## Calculate local gerrymandering based on cpc Districts
 
 # Results
 

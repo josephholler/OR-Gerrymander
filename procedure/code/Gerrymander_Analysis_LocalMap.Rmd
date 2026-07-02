@@ -160,7 +160,7 @@ Map the districts
 
 ```{r}
 tmap_mode(mode = "plot")
-districtsmap <- districts |> 
+map_districts <- districts |> 
   tm_shape() +
   tm_polygons(fill_alpha = 0,
               col = "red") +
@@ -172,7 +172,7 @@ districtsmap <- districts |>
           just = c("center", "center")
           )
 
-districtsmap
+map_districts
 ```
 
 
@@ -217,7 +217,8 @@ blockgroups <- st_transform(blockgroups, 4269)
 ```
 
 Find the total of people identifying as Black or African American as one race or any combination of multiple races.
-First, make a list of all the variables inclusive of people identifying as Black or African American.
+First, make a list of all the variables inclusive of people identifying as Black or African American.  
+**NOTE:** If we were to analyze multiple minority racial or ethnic groups, it may be wiser to focus on the `P4` table crosstabulating race and ethnicity and to focus on individuals identifying as only one race. This is to avoid double-counting people and simplify calculations.
 
 ```{r}
 minority_cat <- "Black"
@@ -236,11 +237,9 @@ Next, calculate new columns.
 `pctMinority` is calculated as `Black / Total * 100`  
 `CheckPct` is calculated as the percentage of the population 18 years or older that is either white of one race only (`P3_003N`) *or* Black or African American as calculated above. In Alabama and Louisiana, we can expect that this will be close to 100% for most block groups, and should never exceed 100%.
 
-**Note:** To scale for the whole United States, or any state for which it is important to calculate multiple minority groups, it may be wiser to simplify the calculation and avoid double-counting people by focusing on people identifying as only one race.
-
 ```{r}
-blockgroups_calc <- blockgroups 
-st_geometry(blockgroups_calc) <- "geom" 
+blockgroups_calc <- blockgroups |> dplyr::filter(!st_is_empty(geom))
+#st_geometry(blockgroups_calc) <- "geom" 
 blockgroups_calc <- blockgroups_calc |> 
   rowwise() |> 
   mutate(minority = sum(c_across(all_of(minority_vars$name)))) |> 
@@ -265,7 +264,7 @@ Map the percentage of the population 18 or over that is a minority.
 
 ```{r message=FALSE}
 tmap_mode(mode = "plot")
-blkgrp_black_map <- tm_shape(blockgroups_calc) + 
+map_minority_race <- tm_shape(blockgroups_calc) + 
   tm_polygons(
     fill = "pctMinority",
     col_alpha = 0.2,
@@ -273,7 +272,7 @@ blkgrp_black_map <- tm_shape(blockgroups_calc) +
     col = "grey90"
   )
 
-blkgrp_black_map
+map_minority_race
 ```
 Make an interactive map of the 2021 districts over the black population.
 
@@ -281,38 +280,47 @@ Make an interactive map of the 2021 districts over the black population.
 
 ```{r warning=FALSE}
 tmap_mode(mode = "view")
-blkgrp_black_map +
-  districtsmap
+map_minority_race +
+  map_districts
 ```
 
 ## Analysis
 
-Estimate the white and black voting age populations using AWR with block groups.
-Why do this when POPULATION, BLACK, and WHITE variables are already in the table?
-First, this is the total population, but we should care more about the voting age population.
-Second, we may want to categorize and calculate `BLACK` differently from the state of Alabama.
-
-It turns out that R optimizes the *first* dataset in a spatial query or overlay, with a spatial index, and not the second.
-Therefore, add the more complex data to `st_intersection` first, and you'll see remarkably different run times.
-
-Spatial indices in R: https://r-spatial.org/r/2017/06/22/spatial-index.html
+### District composition
 
 - `race_fragments` are the intersection between Block Groups and Districts.
 - `district_estimates` are tabular results by district
 - `districts_join` are tabular results joined to the district polygons
+- Minority (African American or Black) voting-age population is estimated with areal interpolation as `awMinor` in `race_fragments` and `bgMinority` in `districts_join`
+- Total voting-age population is estimated with areal interpolation as `awTot` in `race_fragments` and `bgTotal` in `districts_join`
 
-### District Composition
+In the areal interpolation below, we take several steps to ensure that the 'fragments' are valid single-part polygons:
+
+- `st_intersection` passes the option `dimensions="polygon"` to `s2_options`
+- `sf` optimizes the *first* dataset in a spatial query or overlay with a spatial index, so the more complex race or voting data is first.
+- `st_make_valid()` ensures valid geometries 
+- `filter(!st_is_empty(geom))` removes results resulting in empty geometry collections
+- `st_cast("MULTIPOLYGON") |> st_cast("POLYGON")` converts results to single-part polygons. It seems strange to convert to multipolygons first, but this is required in R `sf` to avoid losing parts of multi-part features when there are mixed geometry types. 
+
+Areal interpolation / decomposition into fragments:
 
 ```{r warning=FALSE}
-race_fragments <- st_intersection(blockgroups_calc, districts) |> 
+race_fragments <- st_intersection(blockgroups_calc, districts, dimensions="polygon") |> 
   st_make_valid() |> 
+  dplyr::filter(!st_is_empty(geom)) |> 
+  st_cast("MULTIPOLYGON") |> st_cast("POLYGON") |> 
   mutate(
     awTot = Total * as.numeric(st_area(geom) / sarea),
-    awMinor = minority * as.numeric(st_area(geom) / sarea)
+    awMinor = minority * as.numeric(st_area(geom) / sarea),
+    frag_id = row_number()
   ) |> 
-  select(DISTRICT, Total = awTot, minority = awMinor) |> 
-  mutate(sarea = st_area(geom))
+  select(DISTRICT, frag_id, sarea, Total = awTot, minority = awMinor)
 
+```
+
+Aggregation into districts:
+
+```{r warning=FALSE}
 district_estimates <- race_fragments |> 
   st_drop_geometry() |> 
   group_by(DISTRICT) |> 
@@ -324,7 +332,6 @@ districts_join <- districts |>
   mutate(pctMinoritybg = round(bgMinority / bgTotal * 100, 1))
 ```
 
-
 Report results.
 We find very similar percentages of Black or African American people using 
 areal interpolation with block group data.
@@ -335,9 +342,11 @@ districts_join |> st_drop_geometry() |> kable()
 
 ### Convex Hulls of Districts and their Composition
 
-- `d_ch`: convex hulls
+- `d_ch`: convex hulls of each district
 - `d_ch_frag`: fragments from overlay of convex hulls with block groups
 - `d_ch_est`: district-level summary table of convex hull composition
+- Minority (African American or Black) voting-age population is estimated with areal interpolation as `awMinor` in `d_ch_frag` and `chMinority` in `d_ch_est`
+- Total voting-age population is estimated with areal interpolation as `awTot` in `d_ch_frag` and `chTotal` in `d_ch_est`
 
 NOTE: Filter fragments for polygons, not just valid geometries!
 
@@ -348,12 +357,13 @@ d_ch <- districts |>
   mutate(chArea = st_area(geom))
   
 d_ch_frag <- race_fragments |> 
-  st_intersection(d_ch) |> 
+  st_intersection(d_ch, dimensions="polygon") |> 
   st_make_valid() |> 
+  dplyr::filter(!st_is_empty(geom)) |> 
+  st_cast("MULTIPOLYGON") |> st_cast("POLYGON") |> 
   mutate(
-    fArea = st_area(geom),
-    awTot = Total * as.numeric(fArea / sarea),
-    awMinor = minority * as.numeric(fArea / sarea),
+    awTot = Total * as.numeric(st_area(geom) / sarea),
+    awMinor = minority * as.numeric(st_area(geom) / sarea),
   )
 
 d_ch_est <- d_ch_frag |> 
@@ -363,29 +373,28 @@ d_ch_est <- d_ch_frag |>
             chMinority = sum(awMinor, na.rm = TRUE))
 ```
 
-### District Compactness and CDiff
+### District Cdiff scores
 
 Join convex hull estimates to Districts with block group estimates.
 
-Calculate Cdiff scores
-
-- `chDiff` is the District composition - the Convex Hull composition
-- `ChAbsDiff` is the absolute value of chDiff
-
-Calculate compactness scores based on:
-
-- the area and perimeter
-- the area and the area of the convex hull
-
-Note: 
-To knit, will we need to replace `st_perimeter()` with `st_length(st_cast(geom, "MULTILINESTRING"))`?
+- `chDiff` is the District composition minus the Convex Hull composition. A positive number indicates over-representation (packing?) in the district compared to the convex hull of the district, while a negative number represents an under-representation (dilution? cracking?) in the district compared to the convex hull of the district.
+- `ChAbsDiff` is the absolute value of chDiff to measure total change in composition of the district compared to the convex hull of the district.
 
 ```{r}
 districts_results <- districts_join |> 
   left_join(d_ch_est, by = c("DISTRICT" = "chDISTRICT")) |> 
   mutate(chPct = round(chMinority / chTotal * 100, 1),
          chDiff = pctMinoritybg - chPct,
-         chAbsDiff = abs(chDiff)) |> 
+         chAbsDiff = abs(chDiff)) 
+```
+
+### District Compactness scores
+
+- `compact_shp` is the Posby-Popper metric based on the district area (`darea`) and perimeter (`dperim`)
+- `compact_hull` is based on the district area (`darea`) and the area of the convex hull (`chArea`, calculated above)
+
+```{r}
+districts_results <- districts_results |> 
   mutate(
     darea = st_area(geom),
     dperim = st_length(st_cast(geom, "MULTILINESTRING")),
@@ -394,20 +403,17 @@ districts_results <- districts_join |>
   )
 ```
 
-
 ### Local Gerrymandering Scores
 
-Calculate local gerrymandering scores by...
-
-- Join District-level chDiff data to the fragments
+- Join District-level `chDiff` data to the `ch_frags` fragments from overlaying convex hulls with census geometries.
 - `minorRatio` is the local minority ratio of the fragment
 - `gerry_type` is the type of gerrymandering for the given fragment: `packing` when the fragment is inside of its district (`DISTRICT == chDISTRICT`) and `diluting` when he fragment is outside of its district (`DISTRICT != chDISTRICT`)
 - `chRatio` is the minority ratio of the relevant district or convex hull, which is the chDiff of the district for packing and the chDiff of the convex hull (`ch_hull_Diff`) for diluting
-- `gerry` is a local estimate of wasted minority votes due to gerrymandering. 
+- `gerry` represents total wasted minority votes due to gerrymandering, estimated in the packing form as the proportion of voting-age minorities in the fragment in excess of the proportion of voting-age minorities in the convex hull, and in the dilution form as the proportion of voting-age minorities in the fragment in excess of the proportion of voting-age minorities in the district.
 
-EXPLAIN gerry
-CONFIRM the code still works when using the gerry_type variable
+**NOTE:** Currently there is no check for overlapping fragments. That means that the same location may contribute to packing in one distict *and* dilution/cracking in one or more districts. In a sense, wasted votes are potentially counted more than once. Does this make sense? It probably does, because wasting those votes is having an impact on elections in more than one district simultaneously.
 
+**NOTE:** We also have not made an attempt here to ensure that the total local wasted votes accounts for exactly the same shift in composition observed between the whole district and its convex hull. In order to do that, we would have to estimate the total wasted votes at the district level and then allocate them to the local areas in proportion to the local estimate of wasted local votes we have here. The total of local wasted votes would likely decrease while the spatial pattern would remain the same.
 
 ```{r wasted-votes}
 districts_results_table <- districts_results |> st_drop_geometry() |> 
@@ -437,39 +443,38 @@ ch_frags <- ch_frags |>
            .default = 0
          ),
          gerryPortionMinor = gerry / awMinor,
-         gerryProportionTotal = gerry / awTot
-         )
+         gerryProportionTotal = gerry / awTot,
+         gerryDots = as.integer(round(gerry/20, digits=0)),
+         centroid_geom = st_centroid(geom)
+         ) |> 
+  dplyr::filter(gerry > 0)
 ```
 
+Map local wasted votes due to gerrymandering according to the convex hull method.
 
 ```{r wasted-viz}
 tmap_mode(mode = "plot")
 
-ch_frags |> dplyr::filter(gerry > 0) |> 
- tm_shape() + 
-  tm_polygons(
-    fill = "gerryPortionMinor",
-    col_alpha = 0.2,
-    lwd = 0.1,
-    col = "grey90"
-  ) +
-tm_shape(districts) +
-  tm_polygons(fill_alpha = 0,
-              col = "red")
+map_local_gerry <- ch_frags |> dplyr::filter(gerry > 0) |> 
+ tm_shape(bbox = st_bbox(districts)) + 
+  tm_fill(
+    fill = "gerryPortionMinor"
+  ) 
 
+map_local_gerry + map_districts
 ```
+Save the resulting local gerrymander areas.
 
-```{r}
-ch_frags |> dplyr::filter(gerry > 0) |> 
+```{r warning=FALSE}
+sf_use_s2(FALSE)  #ensures that GEOS engine is used rather than S2, so that geometries are planimetrically correct
+ch_frags |> st_make_valid() |> 
   st_write(here("data", "derived", "public", result_set, "ch_gerry_frags.gpkg"),
            append=FALSE)
+sf_use_s2(TRUE)
 ```
 
 
 ### Centroids and Dot Density
-
-- are the geometries valid?  QGIS didn't think so, but st_make_valid has been applied?
-
 
 ```{r}
 districts_results |> st_write(here("data", "derived", "public", result_set, "district_results_LA.gpkg"),
@@ -478,7 +483,102 @@ districts_results |> st_drop_geometry() |>
   write_csv(here("data", "derived", "public", result_set, "district_results_LA.csv" ))
 ```
 
-# mean_center function
+# Population-weighted mean center of districts
+
+This should be done in a planar coordinate system, but is currently not.
+
+```{r}
+pop_points <- race_fragments |> st_centroid()
+
+district_pop_centers <- pop_points |> 
+  mutate(
+    wx = st_coordinates(geom)[, "X"] * Total,
+    wy = st_coordinates(geom)[, "Y"] * Total
+  ) |> 
+  st_drop_geometry() |> 
+  group_by(DISTRICT) |> 
+  summarize(sumwx = sum(wx), sumwy = sum(wy), sumw = sum(Total)) |> 
+  mutate(wcx = sumwx/sumw,
+         wcy = sumwy/sumw) 
+```
+Visualize district mean centers with green dots.
+
+```{r}
+map_districts +
+  district_pop_centers |> 
+  st_as_sf(coords = c("wcx", "wcy"), crs=4269) |> 
+  tm_shape() +
+    tm_dots(fill = "green", size = 1) +
+    tm_text("DISTRICT")
+```
+Distance matrix
+
+```{r}
+dcenters <- district_pop_centers |> st_drop_geometry() |> 
+  select(district_2 = DISTRICT, wcx, wcy)
+race_fragment_distances <- race_fragments |> 
+  cross_join(dcenters) 
+
+race_fragment_distances$dcenter <- race_fragment_distances |> 
+  st_drop_geometry() |> 
+  st_as_sf(coords = c("wcx", "wcy"), crs=4269) |> 
+  st_geometry() 
+
+race_fragment_distances <- race_fragment_distances |> 
+  mutate(distance = st_distance(st_centroid(geom), dcenter, 
+                                by_element = TRUE))
+```
+
+Visualize distance from weighted population center
+
+```{r}
+dist <- race_fragment_distances |> st_drop_geometry() |> 
+  dplyr::filter(DISTRICT == district_2) |> 
+  select(frag_id, distance)
+
+race_fragments |> left_join(dist, by="frag_id") |> 
+  tm_shape() +
+  tm_fill(fill = "distance",
+          fill.scale = tm_scale_intervals(n = 10, style = "equal", values = "viridis"))
+```
+
+Construct compact districts
+
+- `idealpop` is the total voting age population divided by the number of districts. Notably, this is not the same as the total population, which is the criteria used in redistricting. This could be revisited, and would require areal interpolation of total population.
+- `compact_pop_center_fragments` are the population fragments belonging to each compact population-weighted center district
+- `compact_pop_center_districts` are the aggregated districts based on the compact population-weighted center
+
+```{r}
+idealpop <- sum(blockgroups_calc$Total)/6
+
+compact_pop_center_fragments <- race_fragment_distances |> 
+  st_drop_geometry() |> 
+  arrange(district_2, distance) |> 
+  group_by(district_2) |> 
+  mutate(cumulative_pop = cumsum(Total)) |> 
+  dplyr::filter(cumulative_pop <= idealpop) |> 
+  ungroup() |> 
+  select(frag_id, cpcDistrict = district_2) |> 
+  left_join(race_fragments, by = "frag_id") |> 
+  st_set_geometry("geom")
+
+compact_pop_center_districts <- compact_pop_center_fragments |> 
+  group_by(cpcDistrict) |> 
+  summarize(cpcMinority = sum(minority),
+            cpcTotal = sum(Total),
+            geom = st_union(geom)) 
+```
+
+Visualize the compact population-weighted center districts
+
+```{r}
+map_districts +
+compact_pop_center_districts |> st_buffer(0.0000001) |> st_buffer(-0.0000001) |> 
+  mutate(District_Number = as.character(cpcDistrict)) |> 
+  tm_shape() +
+  tm_polygons(fill = "District_Number",
+              fill_alpha = 0.3)
+```
 
 # Results
 

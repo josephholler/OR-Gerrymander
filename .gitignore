@@ -109,3 +109,6 @@ $RECYCLE.BIN/
 
 # Jupyter cache folder
 cache/**
+data/derived/public/LA2024v2/gerry_heat_10k_20m.tif
+data/derived/public/LA2024v2/ch_gerry_borders.gpkg
+data/derived/public/LA2024v2/gerry_heat_10k_20m.tif.aux.xml

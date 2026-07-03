@@ -73,7 +73,7 @@ if (!require(groundhog)) {
 
 # this date will be used to determine the versions of R and your packages
 # it is best practice to keep R and its packages up to date
-groundhog.day <- "2026-06-01"
+groundhog.day <- "2026-06-30"
 
 
 # this replaces any library() or require() calls
@@ -163,13 +163,15 @@ tmap_mode(mode = "plot")
 map_districts <- districts |> 
   tm_shape() +
   tm_polygons(fill_alpha = 0,
-              col = "red") +
-  tm_labels(text = "DISTRICT",
-          col="red",
-          bgcol = "white",
-          bgcol_alpha = 0.5,
-          on_surface = TRUE,
-          just = c("center", "center")
+              col = "red",
+              col_alpha = 0.5) +
+  tm_text(text = "DISTRICT",
+          col="black",
+        #  bgcol = "white",
+          bgcol_alpha = 0.7,
+          options = opt_tm_text(on_surface = TRUE,
+                                halo = TRUE,
+                                halo.col = "white")
           )
 
 map_districts
@@ -272,11 +274,9 @@ map_minority_race <- tm_shape(blockgroups_calc) +
     col = "grey90"
   )
 
-map_minority_race
+map_minority_race + map_districts
 ```
 Make an interactive map of the 2021 districts over the black population.
-
-**NOTE:** There is currently a bug in the choropleth classification in view mode. Everything is displaying as neutral blue.
 
 ```{r warning=FALSE}
 tmap_mode(mode = "view")
@@ -413,7 +413,9 @@ districts_results <- districts_results |>
 
 **NOTE:** Currently there is no check for overlapping fragments. That means that the same location may contribute to packing in one distict *and* dilution/cracking in one or more districts. In a sense, wasted votes are potentially counted more than once. Does this make sense? It probably does, because wasting those votes is having an impact on elections in more than one district simultaneously.
 
-**NOTE:** We also have not made an attempt here to ensure that the total local wasted votes accounts for exactly the same shift in composition observed between the whole district and its convex hull. In order to do that, we would have to estimate the total wasted votes at the district level and then allocate them to the local areas in proportion to the local estimate of wasted local votes we have here. The total of local wasted votes would likely decrease while the spatial pattern would remain the same.
+**NOTE:** We also have not ensured that the total local wasted votes accounts for exactly the same shift in composition observed between the whole district and its convex hull. In order to do that, we would have to estimate the total wasted votes at the district level and then allocate them to the local areas in proportion to the local estimate of wasted local votes we have here. The total of local wasted votes would likely decrease while the spatial pattern would remain the same.
+
+**IDEA:** One could add a flag/code for gerrymandering that crosses the 50% threshold for voting outcomes.
 
 ```{r wasted-votes}
 districts_results_table <- districts_results |> st_drop_geometry() |> 
@@ -463,6 +465,7 @@ map_local_gerry <- ch_frags |> dplyr::filter(gerry > 0) |>
 
 map_local_gerry + map_districts
 ```
+
 Save the resulting local gerrymander areas.
 
 ```{r warning=FALSE}
@@ -472,7 +475,6 @@ ch_frags |> st_make_valid() |>
            append=FALSE)
 sf_use_s2(TRUE)
 ```
-
 
 ### Centroids and Dot Density
 
@@ -501,17 +503,20 @@ district_pop_centers <- pop_points |>
   mutate(wcx = sumwx/sumw,
          wcy = sumwy/sumw) 
 ```
-Visualize district mean centers with green dots.
+Visualize district mean centers.
 
 ```{r}
-map_districts +
-  district_pop_centers |> 
+map_pop_centers <- district_pop_centers |> 
   st_as_sf(coords = c("wcx", "wcy"), crs=4269) |> 
   tm_shape() +
-    tm_dots(fill = "green", size = 1) +
-    tm_text("DISTRICT")
+    tm_dots(fill = "green", size = 1.2) +
+    tm_text("DISTRICT", size = 1,
+            just=c("center", "top"))
+
+map_districts + map_pop_centers
 ```
-Distance matrix
+
+Calculate a distance matrix
 
 ```{r}
 dcenters <- district_pop_centers |> st_drop_geometry() |> 
@@ -539,7 +544,9 @@ dist <- race_fragment_distances |> st_drop_geometry() |>
 race_fragments |> left_join(dist, by="frag_id") |> 
   tm_shape() +
   tm_fill(fill = "distance",
-          fill.scale = tm_scale_intervals(n = 10, style = "equal", values = "viridis"))
+          fill.scale = tm_scale_intervals(n = 10, style = "equal", values = "viridis")) +
+  map_districts +
+  map_pop_centers
 ```
 
 Construct compact districts
@@ -571,7 +578,7 @@ compact_pop_center_districts <- compact_pop_center_fragments |>
 
 Visualize the compact population-weighted center districts
 
-```{r}
+```{r warning=FALSE}
 map_districts +
 compact_pop_center_districts |> st_buffer(0.0000001) |> st_buffer(-0.0000001) |> 
   mutate(District_Number = as.character(cpcDistrict)) |> 
@@ -580,11 +587,85 @@ compact_pop_center_districts |> st_buffer(0.0000001) |> st_buffer(-0.0000001) |>
               fill_alpha = 0.3)
 ```
 
-# NEXT
+### District Cdiff scores based on compact population centers
 
-## Calculate Cdiff based on cpc Districts
+Join convex hull estimates to Districts with block group estimates.
+
+- `cpcDiff` is the District composition minus the compact population center composition. A positive number indicates over-representation (packing?) in the district compared to the convex hull of the district, while a negative number represents an under-representation (dilution? cracking?) in the district compared to the convex hull of the district.
+- `cpcAbsDiff` is the absolute value of cpcDiff to measure total change in composition of the district compared to the convex hull of the district.
+
+```{r}
+d_cpc_est <- compact_pop_center_districts |> 
+  st_drop_geometry() 
+
+districts_results <- districts_results |> 
+  left_join(d_cpc_est, by = c("DISTRICT" = "cpcDistrict")) |> 
+  mutate(cpcPct = round(cpcMinority / cpcTotal * 100, 1),
+         cpcDiff = pctMinoritybg - cpcPct,
+         cpcAbsDiff = abs(cpcDiff)) 
+```
 
 ## Calculate local gerrymandering based on cpc Districts
+
+### Local Gerrymandering Scores
+
+- Join District-level `cpcDiff` data to the `compact_pop_center_fragments` fragments from overlaying convex hulls with census geometries.
+- `minorRatio` is the local minority ratio of the fragment
+- `gerry_type` is the type of gerrymandering for the given fragment: `packing` when the fragment is inside of its district (`DISTRICT == chDISTRICT`) and `diluting` when he fragment is outside of its district (`DISTRICT != chDISTRICT`)
+- `chRatio` is the minority ratio of the relevant district or compact district shape, which is the chDiff of the district for packing and the chDiff of the compact district (`cpc_compact_Diff`) for diluting.
+- `gerry` represents total wasted minority votes due to gerrymandering, estimated in the packing form as the proportion of voting-age minorities in the fragment in excess of the proportion of voting-age minorities in the convex hull, and in the dilution form as the proportion of voting-age minorities in the fragment in excess of the proportion of voting-age minorities in the district.
+
+**CAUTION:** I have relied too much on comparing the district #'s and the assumption with convex hull that the district is completely inside of the compact shape. Therefore, I am missing some information in the local gerrymandering scores, e.g. the part of a packed district that is outside of the compact shape, and the part of a diluted district that is inside its compact shape.
+
+```{r wasted-votes}
+districts_results_table <- districts_results |> st_drop_geometry() |> 
+  select(DISTRICT, cpcDiff)
+
+# join cDiff from district back to the fragment
+cpc_frags <- compact_pop_center_fragments |> 
+  left_join(districts_results_table, by="DISTRICT")
+
+# will need the cDiff of the cpc district as well: cpc_compact_Diff
+districts_results_table <- districts_results_table |> 
+  select(DISTRICT, cpc_compact_Diff = cpcDiff)
+
+cpc_frags <- cpc_frags |> 
+  left_join(districts_results_table, by=c("cpcDistrict" = "DISTRICT")) |> 
+  mutate(minorRatio = minority / Total,
+         gerry_type = case_when(
+           DISTRICT == cpcDistrict ~ "packing",
+           DISTRICT != cpcDistrict ~ "diluting",),
+         cpcRatio = case_when(
+           gerry_type == "packing" ~ cpcDiff / 100,
+           gerry_type == "diluting" ~ cpc_compact_Diff / 100,
+           .default = 0),
+         gerry = case_when(
+           gerry_type == "packing" & cpcRatio > 0 & minorRatio - cpcRatio > 0 ~ (minorRatio - cpcRatio) * Total,
+           gerry_type == "diluting" & cpcRatio < 0 & minorRatio + cpcRatio > 0 ~ (cpcRatio + minorRatio) * Total,
+           .default = 0
+         ),
+         gerryPortionMinor = gerry / minority,
+         gerryProportionTotal = gerry / Total,
+         gerryDots = as.integer(round(gerry/20, digits=0)),
+         centroid_geom = st_centroid(geom)
+         ) |> 
+  dplyr::filter(gerry > 0)
+```
+
+Map local wasted votes due to gerrymandering according to the convex hull method.
+
+```{r wasted-viz}
+tmap_mode(mode = "plot")
+
+map_local_gerry <- cpc_frags |> dplyr::filter(gerry > 0) |> 
+ tm_shape(bbox = st_bbox(districts)) + 
+  tm_fill(
+    fill = "gerry_type",
+    fill_alpha = 0.3
+  ) 
+
+map_local_gerry + map_districts
+```
 
 # Results
 

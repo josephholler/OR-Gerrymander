@@ -1,5 +1,5 @@
 ---
-title: "Gerrymandering in Alabama: Analysis Plan"
+title: "Parsimonious Approach to Gerrymandering Analysis"
 author: "Joseph Holler"
 date: "`r Sys.Date()`"
 output: html_document

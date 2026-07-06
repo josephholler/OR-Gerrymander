@@ -534,7 +534,8 @@ race_fragment_distances <- race_fragment_distances |>
                                 by_element = TRUE))
 ```
 
-Visualize distance from each district weighted population center to the locations in that district.
+Visualize distance from each district's weighted population center to the locations in that district.
+Very far distances suggest 
 
 ```{r}
 dist <- race_fragment_distances |> st_drop_geometry() |> 
@@ -621,19 +622,31 @@ districts_results <- districts_results |>
 districts_results_table <- districts_results |> st_drop_geometry() |> 
   select(DISTRICT, cpcDiff)
 
-# join cDiff from district back to the fragment
-cpc_frags <- compact_pop_center_fragments |> 
-  left_join(districts_results_table, by="DISTRICT")
+# frag_cpc_dist <- compact_pop_center_fragments |> 
+#   st_drop_geometry() |>
+#   select(frag_id, cpcDistrict)
 
-# will need the cDiff of the cpc district as well: cpc_compact_Diff
-districts_results_table <- districts_results_table |> 
-  select(DISTRICT, cpc_compact_Diff = cpcDiff)
+frag_identity <- compact_pop_center_fragments |> 
+  st_drop_geometry() |> 
+  filter(DISTRICT == cpcDistrict) |> 
+  select(frag_id)
+
+frag_orphans <- race_fragments |> 
+  anti_join(frag_identity, by="frag_id")
+
+cpc_frags <- compact_pop_center_fragments |> 
+  bind_rows(frag_orphans) |> 
+  left_join(districts_results_table, by="DISTRICT") |> 
+  left_join(select(districts_results_table, 
+                   DISTRICT, 
+                   cpc_compact_Diff = cpcDiff),
+            by=c("cpcDistrict" = "DISTRICT"))
 
 cpc_frags <- cpc_frags |> 
-  left_join(districts_results_table, by=c("cpcDistrict" = "DISTRICT")) |> 
   mutate(minorRatio = minority / Total,
          gerry_type = case_when(
            DISTRICT == cpcDistrict ~ "packing",
+           is.na(cpcDistrict) & cpcDiff > 0 ~ "packing",
            DISTRICT != cpcDistrict ~ "diluting",),
          cpcRatio = case_when(
            gerry_type == "packing" ~ cpcDiff / 100,
@@ -648,16 +661,18 @@ cpc_frags <- cpc_frags |>
          gerryProportionTotal = gerry / Total,
          gerryDots = as.integer(round(gerry/20, digits=0)),
          centroid_geom = st_centroid(geom)
-         ) |> 
-  dplyr::filter(gerry > 0)
+         ) 
+
+# |>  dplyr::filter(gerry > 0)
 ```
 
-Map local wasted votes due to gerrymandering according to the convex hull method.
+Map local wasted votes due to gerrymandering according to the compact weighted population center method.
 
 ```{r wasted-viz}
 tmap_mode(mode = "plot")
 
-map_local_gerry <- cpc_frags |> dplyr::filter(gerry > 0) |> 
+map_local_gerry <- cpc_frags |> 
+  dplyr::filter(gerry > 0) |> 
  tm_shape(bbox = st_bbox(districts)) + 
   tm_fill(
     fill = "gerry_type",
@@ -666,6 +681,12 @@ map_local_gerry <- cpc_frags |> dplyr::filter(gerry > 0) |>
 
 map_local_gerry + map_districts
 ```
+
+Something to consider: since the compact weighted population centers leave some portions of the state uncovered,
+do minority votes in those areas constitute some form of wasted vote in the dilution case?
+For Louisiana specifically, sections of the border between districts 3 and 4 and districts 4 and 5 are contorted to allocate minority votes in areas that are not covered by any compact weighted population center district.
+
+Further, with this population-based approach, it would also be informative to simply find the portion of population of a district that is included in the compact mean population center shape.
 
 # Results
 

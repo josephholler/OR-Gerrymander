@@ -33,7 +33,7 @@ We will then extend prior studies by calculating representativeness of the conve
 - `Conference Presentation`:
 - `Publication`:
 - `Prior Study`:
-- `...`:
+- `Teaching Materials`: https://github.com/giscience-research/Learn-Gerrymandering
 
 ## Metadata for access
 

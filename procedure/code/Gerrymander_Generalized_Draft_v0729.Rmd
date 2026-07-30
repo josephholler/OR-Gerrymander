@@ -115,7 +115,7 @@ gerrymandering and district shape.
 2. Choose `params$district_year` for your research purpose. To evaluate a particular
    election, use the year of the map that election was run under, since some states redrew
    their map mid-decade. You can also override TIGER entirely by placing a specific plan as
-   `districts.gpkg` in the state folder.
+   `districts.gpkg` in the state folder `data/raw/public/<state>/`.
 3. Get a free Census API key at https://api.census.gov/data/key_signup.html and
    install it once by running `census_api_key("YOUR KEY", install = TRUE)` in the
    RStudio console, then restart R. This lets the document download census block
@@ -123,7 +123,7 @@ gerrymandering and district shape.
    files.
 4. To include the voting layer, download that state's "2024 General Election Precinct
    Boundaries and Election Results" from the Redistricting Data Hub and unzip it into
-   `data/raw/<state>/`. The code finds the `_all_` precinct shapefile inside that folder
+   `data/raw/public/<state>/`. The code finds the `_all_` precinct shapefile inside that folder
    automatically, so you can leave the downloaded folder as is. The congressional
    districts and census block groups download automatically, so you do not need those.
 5. Knit the document. The code reads `params$state` and loads that state's data.
@@ -233,7 +233,7 @@ with a programmatic source when a local copy is not present.
 ```{r load-data, results = "hide"}
 # per-state data folder and file paths (edit names to match your files)
 state_slug      <- gsub("[^A-Za-z0-9]+", "_", params$state)
-data_dir        <- here("data", "raw", state_slug)
+data_dir        <- here("data", "raw", "public", state_slug)
 districts_file  <- file.path(data_dir, "districts.gpkg")   # a plan file, or fetched from TIGER
 blockgroup_file <- file.path(data_dir, "block_groups.gpkg")
 census_metadata_file <- here("data", "metadata", "census2020pl_vars.csv")

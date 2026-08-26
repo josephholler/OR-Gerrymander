@@ -469,7 +469,16 @@ little. Big swings between districts are the raw material the rest of the analys
 since gerrymandering works by concentrating a group in a few districts (packing) or spreading it
 thin across many (cracking).
 
-```{r desc-race, echo = FALSE, warning = FALSE}
+# Disabled section
+
+Disabled the following code blocks, which need to be:
+
+- consistent with disaggregating voting data into census blocks
+- responsive to a decision to be inclusive or exclusive with regards to intersectional racial/ethnic identities
+- comprehensive: just summarize all data from blocks simulaneously in one descriptive table
+
+
+```
 race_vars <- c(White = "P3_003N", Black = "P3_004N",
                `Am. Indian / AK Native` = "P3_005N", Asian = "P3_006N",
                `Nat. Hawaiian / Pac. Isl.` = "P3_007N", `Some other race` = "P3_008N",
@@ -516,7 +525,7 @@ race_tab |>
 Hispanic or Latino is an ethnicity that overlaps with race, so it is reported in a separate
 table (Table \@ref(tab:desc-hispanic)) and is not part of the sum above.
 
-```{r desc-hispanic, echo = FALSE, warning = FALSE}
+```
 hisp_tab <- cbind(District = district_labels, dplyr::select(pct, dplyr::all_of(unname(eth_vars))))
 names(hisp_tab) <- c("District", names(eth_vars))
 hisp_tab |>
@@ -535,7 +544,12 @@ where it concentrates, often a city or a historic community, and compare those c
 district lines. When a district line wraps tightly around a cluster, that is a visual sign of
 packing, and when a line cuts a cluster into several districts, that is a visual sign of cracking.
 
-```{r map-dots-setup, include = FALSE}
+
+# Disabled section
+
+Dot density mapping becomes infeasible with large data and small enumeration areas.
+
+```
 set.seed(1)
 dot_people <- 1000   # people per dot (voting age); raise this to speed up rendering
 bg_dots <- blockgroups |> dplyr::filter(!st_is_empty(geom))
@@ -553,7 +567,8 @@ sample_dots <- function(bg, cols) {
 }
 ```
 
-```{r map-dots-group, eval = FALSE,  echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
+```
+{map-dots-group, eval = FALSE,  echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
 if (tolower(params$group) == "hispanic") {
   bg_dots$grp <- bg_dots$P4_002N
 } else {
@@ -617,27 +632,6 @@ districts_join <- districts |>
   left_join(district_estimates, by = "DISTRICT") |>
   mutate(pctMinoritybg = round(bgMinority / bgTotal * 100, 1),
          pctMP = round(mpV / totV * 100, 1))
-```
-
-If precinct data is present, we run the same area-weighted reaggregation on votes to
-get each district's minority party vote share.
-
-```{r district-vote, warning = FALSE}
-if (have_votes) {
-  vote_estimates <- st_intersection(precincts, districts) |>
-    st_make_valid() |>
-    st_collection_extract("POLYGON") |>
-    dplyr::filter(!st_is_empty(geom)) |>
-    mutate(awTot   = totV * as.numeric(st_area(geom) / sarea),
-           awMinor = mpV  * as.numeric(st_area(geom) / sarea)) |>
-    st_drop_geometry() |>
-    group_by(DISTRICT) |>
-    summarize(totV = sum(awTot), mpV = sum(awMinor), .groups = "drop")
-
-  districts_join <- districts_join |>
-    left_join(vote_estimates, by = "DISTRICT") |>
-    mutate(pctMP = round(mpV / totV * 100, 1))
-}
 ```
 
 ## 4.2 Convex hull composition
@@ -1089,39 +1083,8 @@ ggplot(districts_cpc_viz,
 ```
 
 
-```{r cpc-votes}
-# minority party vote inside each compact population-center district. These shapes can
-# overlap or leave gaps, so a precinct in an overlap contributes to more than one district.
-if (have_votes) {
-  
-  cpc_vote_fragments <- precincts |> 
-    st_union(select(cpc_districts, cpcDistrict)) |>
-    st_make_valid() |> st_collection_extract("POLYGON") |>
-    dplyr::filter(!st_is_empty(geom)) |>
-    mutate(awTot   = totV * as.numeric(st_area(geom) / sarea),
-           awMinor = mpV  * as.numeric(st_area(geom) / sarea))
-  
-  cpc_vote_fragments |> st_write(here(output_dir, "cpc_vote_fragments.gpkg"),
-                                 append = FALSE)
-    
-  cpc_estV <- cpc_vote_fragments |>
-    st_drop_geometry() |>
-    filter(!is.na(cpcDistrict)) |> 
-    group_by(cpcDistrict) |>
-    summarize(cpctotV = sum(awTot), 
-              cpcmpV = sum(awMinor),
-              .groups = "drop")
-
-  districts_results <- districts_results |>
-    left_join(cpc_estV, by = c("DISTRICT" = "cpcDistrict")) |>
-    mutate(cpcPctV = round(cpcmpV / cpctotV * 100, 1),
-           cpcDiffV = pctMP - cpcPctV, cpcAbsDiffV = abs(cpcDiffV))
-}
-```
-
-
 ```{r save-districts}
-districts_results |> st_write(here("data", "derived", "public", "Tennessee", "district_results.gpkg"),
+districts_results |> st_write(here(output_dir, "district_results.gpkg"),
                               append = FALSE)
 
 districts_results |> 
@@ -1202,10 +1165,8 @@ tab |>
 ```
 
 ```{r save-results}
-out_dir <- here("data", "derived", "public", result_set)
-
 districts_results |> st_drop_geometry() |>
-  write_csv(file.path(out_dir, "district_results.csv"))
+  write_csv(file.path(output_dir, "district_results.csv"))
 ```
 
 ## 5.2 Interpreting the composition difference (Cdiff)

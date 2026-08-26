@@ -24,7 +24,7 @@ params:
   # A free Census API key must be installed once,
   # and the precinct election file must be downloaded by hand.
   # See "How to run this analysis" below.
-  state: "Louisiana"    # the state to analyze; type any U.S. state name here
+  state: "Tennessee"    # the state to analyze; type any U.S. state name here
   group: "Black"        # group to analyze: a P3 race (Black, Asian, ...) or "Hispanic"
   district_year: 2024   # congressional map year from TIGER; match your research question
 ---
@@ -234,8 +234,8 @@ with a programmatic source when a local copy is not present.
 # per-state data folder and file paths (edit names to match your files)
 state_slug      <- gsub("[^A-Za-z0-9]+", "_", params$state)
 data_dir        <- here("data", "raw", "public", state_slug)
-districts_file  <- file.path(data_dir, "districts.gpkg")   # a plan file, or fetched from TIGER
-blockgroup_file <- file.path(data_dir, "block_groups.gpkg")
+districts_file  <- here(data_dir, "districts.gpkg")   # a plan file, or fetched from TIGER
+blockgroup_file <- here(data_dir, "block_groups.gpkg")
 census_metadata_file <- here("data", "metadata", "census2020pl_vars.csv")
 
 # precincts: use the Redistricting Data Hub "_all_" precinct shapefile found anywhere
@@ -278,14 +278,14 @@ if (file.exists(census_metadata_file)) {
 if (file.exists(blockgroup_file)) {
   blockgroups <- st_read(blockgroup_file)
 } else {
-  blockgroups <- get_decennial(geography = "block group", sumfile = "pl", table = "P3",
+  blockgroups <- get_decennial(geography = "block", sumfile = "pl", table = "P3",
                                year = 2020, state = params$state, output = "wide",
                                geometry = TRUE, keep_geo_vars = TRUE)
   # Hispanic or Latino ethnicity (table P4), for the group = "Hispanic" option
-  hisp <- get_decennial(geography = "block group", sumfile = "pl", table = "P4",
+  hisp <- get_decennial(geography = "block", sumfile = "pl", table = "P4",
                         year = 2020, state = params$state, output = "wide")
   # total population of all ages, used later to size the compact districts
-  totalpop <- get_decennial(geography = "block group", sumfile = "pl",
+  totalpop <- get_decennial(geography = "block", sumfile = "pl",
                             variables = "P1_001N", year = 2020, state = params$state,
                             output = "wide")
   blockgroups <- blockgroups |>
@@ -339,6 +339,7 @@ map_w   <- 8   # map width in inches
 map_asp <- as.numeric((.bb["ymax"] - .bb["ymin"]) /
                       ((.bb["xmax"] - .bb["xmin"]) * cospi(mean(c(.bb["ymin"], .bb["ymax"])) / 180)))
 ```
+
 
 ```{r map-districts, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp, fig.cap = paste0("Congressional districts of ", params$state, ", each labeled by its congressional district number.")}
 ggplot(districts) +
@@ -426,6 +427,36 @@ if (have_votes) {
 }
 ```
 
+
+```{r disaggregate-votes}
+if (have_votes) {
+  # Allocate each precinct's votes to intersecting block groups by voting-age population.
+  vote_fragments <- st_intersection(
+    precincts |>
+      mutate(precinct_id = dplyr::row_number()) |>
+      dplyr::select(precinct_id, totV, mpV),
+    blockgroups_calc |>
+      dplyr::select(GEOID, Total, sarea)
+  ) |>
+    mutate(bg_weight = Total * as.numeric(st_area(geom) / sarea),
+           prec_totV = totV,
+           prec_mpV = mpV) |>
+    group_by(precinct_id) |>
+    mutate(weight = bg_weight / sum(bg_weight),
+           totV = prec_totV * weight,
+           mpV = prec_mpV * weight) |>
+    ungroup() |>
+    group_by(GEOID) |>
+    summarize(totV = sum(totV), mpV = sum(mpV), .groups = "drop")
+
+  blockgroups_calc <- blockgroups_calc |>
+    left_join(st_drop_geometry(vote_fragments), by = "GEOID") |>
+    mutate(totV = coalesce(totV, 0),
+           mpV = coalesce(mpV, 0))
+}
+```
+
+
 ### 3.3.3 Descriptive statistics (racial and ethnic composition by district)
 
 Table \@ref(tab:desc-race) summarizes the racial and ethnic composition of the voting-age
@@ -444,7 +475,8 @@ race_vars <- c(White = "P3_003N", Black = "P3_004N",
                `Nat. Hawaiian / Pac. Isl.` = "P3_007N", `Some other race` = "P3_008N",
                `Two or more races` = "P3_009N")
 eth_vars <- c(`Hispanic or Latino` = "P4_002N", `Not Hispanic or Latino` = "P4_003N")
-all_vars <- c(race_vars, eth_vars)
+vote_vars <- c(`Total Votes` = "totV", `Minority Party Votes` = "mpV")
+all_vars <- c(race_vars, eth_vars, vote_vars)
 
 # per-district composition by area-weighted reaggregation of the block groups
 bg_race <- blockgroups |>
@@ -521,7 +553,7 @@ sample_dots <- function(bg, cols) {
 }
 ```
 
-```{r map-dots-group, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
+```{r map-dots-group, eval = FALSE,  echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
 if (tolower(params$group) == "hispanic") {
   bg_dots$grp <- bg_dots$P4_002N
 } else {
@@ -530,9 +562,9 @@ if (tolower(params$group) == "hispanic") {
 bg_dots$oth <- pmax(bg_dots$P3_001N - bg_dots$grp, 0)
 
 ggplot() +
-  geom_sf(data = districts, fill = NA, color = "grey40", linewidth = 0.3) +
   geom_sf(data = sample_dots(bg_dots, setNames(c("grp", "oth"), c(params$group, "Other"))),
           aes(color = kind), size = 0.15, alpha = 0.5) +
+  geom_sf(data = districts, fill = NA, color = "grey40", linewidth = 0.3) +
   scale_color_manual(values = setNames(c("#2166ac", "grey75"), c(params$group, "Other")),
                      name = NULL) +
   guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
@@ -562,18 +594,29 @@ race_fragments <- st_intersection(blockgroups_calc, districts) |>
   mutate(awTot    = Total * as.numeric(st_area(geom) / sarea),
          awMinor  = minority * as.numeric(st_area(geom) / sarea),
          awTotPop = TotalPop * as.numeric(st_area(geom) / sarea),
+         awtotV = totV * as.numeric(st_area(geom) / sarea),
+         awmpV = mpV * as.numeric(st_area(geom) / sarea),
          frag_id  = row_number()) |>
-  dplyr::select(DISTRICT, frag_id, sarea, Total = awTot, minority = awMinor,
-                TotalPop = awTotPop)
+  dplyr::select(DISTRICT, frag_id, sarea, 
+                Total = awTot, 
+                minority = awMinor,
+                TotalPop = awTotPop,
+                totV = awtotV,
+                mpV = awmpV)
 
 district_estimates <- race_fragments |>
   st_drop_geometry() |>
   group_by(DISTRICT) |>
-  summarize(bgTotal = sum(Total), bgMinority = sum(minority), .groups = "drop")
+  summarize(bgTotal = sum(Total), 
+            bgMinority = sum(minority),
+            totV = sum(totV),
+            mpV = sum(mpV),
+            .groups = "drop")
 
 districts_join <- districts |>
   left_join(district_estimates, by = "DISTRICT") |>
-  mutate(pctMinoritybg = round(bgMinority / bgTotal * 100, 1))
+  mutate(pctMinoritybg = round(bgMinority / bgTotal * 100, 1),
+         pctMP = round(mpV / totV * 100, 1))
 ```
 
 If precinct data is present, we run the same area-weighted reaggregation on votes to
@@ -656,7 +699,7 @@ mbc_crs <- 26900L + as.integer(floor((ctr[1] + 180) / 6) + 1)
 
 d_mbc <- districts |>
   dplyr::select(DISTRICT) |>
-  st_transform(mbc_crs) |>
+  st_transform(3395) |>
   lwgeom::st_minimum_bounding_circle() |>
   st_transform(4269) |>
   mutate(mbcArea = st_area(geom))
@@ -760,6 +803,15 @@ redistricting equalizes total population. Centers and distances are computed in 
 projected coordinate system so that distances are in meters. As with the other shapes,
 composition is measured with the voting-age population.
 
+```{r save-load-race-fragments, warning = FALSE}
+race_fragments |> st_write(
+  here("data", "derived", "public", "Tennessee", "race_frags.gpkg"),
+  append = FALSE
+)
+
+```
+
+
 ```{r cpc-build, warning = FALSE}
 n_districts <- dplyr::n_distinct(districts$DISTRICT)
 idealpop <- sum(blockgroups_calc$TotalPop) / n_districts
@@ -779,7 +831,7 @@ centers <- frag_tab |>
 
 # for each center, take the nearest fragments until the target population is reached
 cpc_assign <- frag_tab |>
-  dplyr::select(frag_id, x, y, TotalPop, Total, minority) |>
+  dplyr::select(frag_id, DISTRICT, x, y, TotalPop, Total, minority, totV, mpV) |>
   cross_join(centers) |>
   mutate(dist = sqrt((x - cx)^2 + (y - cy)^2)) |>
   arrange(cpcDistrict, dist) |>
@@ -787,35 +839,278 @@ cpc_assign <- frag_tab |>
   mutate(cumpop = cumsum(TotalPop)) |>
   dplyr::filter(cumpop <= idealpop) |>
   ungroup()
+```
 
+Create one spatial layer of locations and their status *vis-a-vis* cpc's.
+
+```{r cpc-fragments, warning = FALSE}
+# join cpc assignment table to race_fragments spatial features
+cpc_fragments <- race_fragments |>
+  left_join(dplyr::select(cpc_assign, frag_id, cpcDistrict), by = "frag_id")
+
+# identity fragments are inside of both the district and it's cpc
+cpc_identity <- cpc_fragments |> filter(DISTRICT == cpcDistrict) |> 
+  mutate(cpc_type = 'identity')
+
+# captured fragments are inside the district, but not it's cpc, as if the
+# compact district boundaries were stretched out to capture these areas
+cpc_capture <- race_fragments |> 
+  anti_join(st_drop_geometry(cpc_identity), by = "frag_id") |> 
+  mutate(cpc_type = 'captured')
+
+# excluded fragments are outside the district, but inside it's cpc, as if
+# the compact district boundaries were shrunk / contorted to exclude these areas
+cpc_excluded <- cpc_fragments |> 
+  filter(DISTRICT != cpcDistrict) |> 
+  mutate(cpc_type = 'excluded') 
+
+# count how many cpc's overlapped
+cpc_excluded_n <- cpc_excluded |>
+  st_drop_geometry() |> 
+  group_by(frag_id) |> 
+  summarize(excluded_count = n(), .groups ="drop")
+
+# join the count back to the cpc_excluded fragments
+cpc_excluded <- cpc_excluded |> 
+  left_join(cpc_excluded_n, by = "frag_id")
+
+# merge all three cases of CPCs together and save
+cpc_fragments <- bind_rows(cpc_identity, cpc_capture, cpc_excluded)
+
+cpc_fragments |> st_write(here("data", "derived", "public", "Tennessee", "cpc_fragments.gpkg"),
+                          append = FALSE)
+```
+
+Summarize CPC results at the district level
+
+```{r cpc-summary, warning = FALSE}
 # composition inside each compact population-center district (voting-age)
 cpc_est <- cpc_assign |>
   group_by(cpcDistrict) |>
-  summarize(cpcTotal = sum(Total), cpcMinority = sum(minority), .groups = "drop")
+  summarize(cpcTotal = sum(Total), 
+            cpcMinority = sum(minority),
+            cpcIdealPop = sum(TotalPop),
+            cpctotV = sum(totV),
+            cpcmpV = sum(mpV)) |> 
+  mutate(cpcPct = round(cpcMinority / cpcTotal * 100, 1),
+         cpcPctV = round(cpcmpV / cpctotV * 100, 1))
+
+cpc_cases <- cpc_fragments |> 
+  group_by(DISTRICT, cpcDistrict, cpc_type) |> 
+  summarize(cpcTotal = sum(Total), 
+            cpcTargetPop = sum(TotalPop),
+            cpcMinority = sum(minority),
+            cpctotV = sum(totV),
+            cpcmpV = sum(mpV)) |> 
+  ungroup()
+
+cpc_cases |> st_write(here("data", "derived", "public", "Tennessee", "cpc_cases.gpkg"),
+                      append = FALSE)
+
+cpcd_identity <- cpc_cases |> 
+  filter(cpc_type == 'identity') |> 
+  st_drop_geometry() |> 
+  mutate(cpcidTotal = cpcTotal, 
+         cpcidMinority = cpcMinority,
+         cpcidIdealPop = cpcTargetPop,
+         cpcidPctMinority = round(cpcidMinority / cpcidTotal * 100, 1),
+         cpcidtotV = cpctotV,
+         cpcidmpV = cpcmpV,
+         cpcidPctV = round(cpcidmpV / cpcidtotV * 100, 1)) |> 
+  select(DISTRICT, starts_with("cpcid"))
+
+cpcd_captured <- cpc_cases |> 
+  filter(cpc_type == 'captured') |> 
+  st_drop_geometry() |> 
+  mutate(cpccaTotal = cpcTotal, 
+         cpccaMinority = cpcMinority,
+         cpccaIdealPop = cpcTargetPop,
+         cpccaPctMinority = round(cpccaMinority / cpccaTotal * 100, 1),
+         cpccatotV = cpctotV,
+         cpccampV = cpcmpV,
+         cpccaPctV = round(cpccampV / cpccatotV * 100, 1)) |> 
+  select(DISTRICT, starts_with("cpcca"))
+
+cpcd_excluded <- cpc_cases |> 
+  filter(cpc_type == 'excluded') |> 
+  st_drop_geometry() |> 
+  group_by(cpcDistrict) |> 
+  summarize(cpcexTotal = sum(cpcTotal),
+            cpcexMinority = sum(cpcMinority), 
+            cpcexIdealPop = sum(cpcTargetPop),
+            cpcextotV = sum(cpctotV),
+            cpcexmpV = sum(cpcmpV)) |> 
+  mutate(DISTRICT = cpcDistrict,
+         cpcexPctMinority = round(cpcexMinority / cpcexTotal * 100, 1),
+         cpcexPctV = round(cpcexmpV / cpcextotV * 100, 1)) |> 
+  select(DISTRICT, starts_with("cpcex"))
 
 # dissolve the assigned fragments into compact population-center district shapes
-cpc_districts <- race_fragments |>
-  dplyr::select(frag_id) |>
-  inner_join(dplyr::select(cpc_assign, frag_id, cpcDistrict), by = "frag_id") |>
+cpc_districts <- bind_rows(cpc_excluded, cpc_identity) |>
   group_by(cpcDistrict) |>
-  summarize(.groups = "drop")
+  summarize() |> 
+  left_join(cpc_est, by="cpcDistrict")
+
+cpc_districts |> st_write(here("data", "derived", "public", "Tennessee", "cpc_shapes.gpkg"),
+                      append = FALSE)
 
 districts_results <- districts_results |>
   left_join(cpc_est, by = c("DISTRICT" = "cpcDistrict")) |>
-  mutate(cpcPct = round(cpcMinority / cpcTotal * 100, 1),
-         cpcDiff = pctMinoritybg - cpcPct, cpcAbsDiff = abs(cpcDiff))
+  left_join(cpcd_identity, by = "DISTRICT") |> 
+  left_join(cpcd_captured, by = "DISTRICT") |> 
+  left_join(cpcd_excluded, by = "DISTRICT")
 
+districts_results <- districts_results |>
+  mutate(cpcDiff = pctMinoritybg - cpcPct, cpcAbsDiff = abs(cpcDiff),
+         cpcIdentityPct = cpcidTotal / bgTotal * 100,
+         cpcCapturePctDiff = cpccaPctMinority - cpcidPctMinority,
+         cpcExcludePctDiff = cpcexPctMinority - cpcidPctMinority,
+         cpcDiffV = pctMP - cpcPctV,
+         cpcAbsDiffV = abs(cpcDiffV),
+         cpcIdentityPctV = cpcidtotV / totV * 100,
+         cpcCapturePctDiffV = cpccaPctV - cpcidPctV,
+         cpcExcludePctDiffV = cpcexPctV - cpcidPctV,
+         )
+```
+
+
+```{r scatterplot_cpcs}
+ggplot(data = districts_results, mapping = aes(x = cpcIdentityPct, y = cpcDiff)) + 
+  geom_text(aes(label = DISTRICT))
+```
+
+```{r cpc-viz}
+districts_cpc_viz <- districts_results |> st_drop_geometry() |>
+  dplyr::select(DISTRICT, cpcDiff, cpcexTotal, cpcidTotal, cpccaTotal,
+                cpcexPctMinority, cpcidPctMinority, cpccaPctMinority,
+                cpcIdentityPct) |>
+  arrange(desc(cpcDiff), DISTRICT) |>
+  mutate(rank = row_number(),
+         district_label = paste0("District ", DISTRICT, " (", round(cpcDiff, 1), ")")) |>
+  pivot_longer(cols = c(cpcexTotal, cpcidTotal, cpccaTotal),
+               names_to = "segment", values_to = "width") |>
+  mutate(pct_minority = case_when(
+    segment == "cpcexTotal" ~ cpcexPctMinority,
+    segment == "cpcidTotal" ~ cpcidPctMinority,
+    segment == "cpccaTotal" ~ cpccaPctMinority
+  ),
+  segment = factor(segment,
+                   levels = c("cpcexTotal", "cpcidTotal", "cpccaTotal"))) |>
+  group_by(DISTRICT) |>
+  arrange(segment, .by_group = TRUE) |>
+  mutate(total_width = sum(width),
+         xmin = -total_width / 2 + cumsum(width) - width,
+         xmax = -total_width / 2 + cumsum(width)) |>
+  ungroup()
+
+cpc_viz_extent <- max(districts_cpc_viz$total_width, na.rm = TRUE) / 2
+
+ggplot(districts_cpc_viz,
+       aes(y = rank, xmin = xmin, xmax = xmax,
+           ymin = rank - 0.35, ymax = rank + 0.35,
+           fill = pct_minority)) +
+  geom_rect(color = "white", linewidth = 0.4) +
+  geom_text(data = dplyr::filter(districts_cpc_viz, segment == "cpcidTotal"),
+            aes(x = (xmin + xmax) / 2,
+                label = paste0(round(cpcIdentityPct, 1), "%")),
+            inherit.aes = FALSE, y = districts_cpc_viz$rank[
+              districts_cpc_viz$segment == "cpcidTotal"],
+            color = "white", fontface = "bold") +
+  scale_y_reverse(breaks = unique(districts_cpc_viz$rank),
+                  labels = districts_cpc_viz$district_label[match(
+                    unique(districts_cpc_viz$rank), districts_cpc_viz$rank)]) +
+  scale_x_continuous(breaks = c(-cpc_viz_extent, 0, cpc_viz_extent),
+                     labels = c("excluded", "identity", "captured")) +
+  scale_fill_distiller(palette = "YlGnBu", direction = 1,
+                       limits = c(0, 100), name = "Minority share (%)") +
+  labs(x = NULL,
+       y = "District (CPC difference)") +
+  theme_bw(base_size = 15) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+```
+
+```{r scatterplot_cpc_votes}
+ggplot(data = districts_results, mapping = aes(x = cpcIdentityPctV, y = cpcDiffV)) + 
+  geom_text(aes(label = DISTRICT))
+```
+
+```{r cpc-viz-votes}
+districts_cpc_viz <- districts_results |> st_drop_geometry() |>
+  dplyr::select(DISTRICT, cpcDiffV, cpcextotV, cpcidtotV, cpccatotV,
+                cpcexPctV, cpcidPctV, cpccaPctV,
+                cpcIdentityPctV) |>
+  arrange(desc(cpcDiffV), DISTRICT) |>
+  mutate(rank = row_number(),
+         district_label = paste0("District ", DISTRICT, " (", round(cpcDiffV, 1), ")")) |>
+  pivot_longer(cols = c(cpcextotV, cpcidtotV, cpccatotV),
+               names_to = "segment", values_to = "width") |>
+  mutate(pct_minority = case_when(
+    segment == "cpcextotV" ~ cpcexPctV,
+    segment == "cpcidtotV" ~ cpcidPctV,
+    segment == "cpccatotV" ~ cpccaPctV
+  ),
+  segment = factor(segment,
+                   levels = c("cpcextotV", "cpcidtotV", "cpccatotV"))) |>
+  group_by(DISTRICT) |>
+  arrange(segment, .by_group = TRUE) |>
+  mutate(total_width = sum(width),
+         xmin = -total_width / 2 + cumsum(width) - width,
+         xmax = -total_width / 2 + cumsum(width)) |>
+  ungroup()
+
+cpc_viz_extent <- max(districts_cpc_viz$total_width, na.rm = TRUE) / 2
+
+ggplot(districts_cpc_viz,
+       aes(y = rank, xmin = xmin, xmax = xmax,
+           ymin = rank - 0.35, ymax = rank + 0.35,
+           fill = pct_minority)) +
+  geom_rect(color = "white", linewidth = 0.4) +
+  geom_text(data = dplyr::filter(districts_cpc_viz, segment == "cpcidTotV"),
+            aes(x = (xmin + xmax) / 2,
+                label = paste0(round(cpcIdentityPctV, 1), "%")),
+            inherit.aes = FALSE, y = districts_cpc_viz$rank[
+              districts_cpc_viz$segment == "cpcidTotV"],
+            color = "white", fontface = "bold") +
+  scale_y_reverse(breaks = unique(districts_cpc_viz$rank),
+                  labels = districts_cpc_viz$district_label[match(
+                    unique(districts_cpc_viz$rank), districts_cpc_viz$rank)]) +
+  scale_x_continuous(breaks = c(-cpc_viz_extent, 0, cpc_viz_extent),
+                     labels = c("excluded", "identity", "captured")) +
+  scale_fill_distiller(palette = "YlGnBu", direction = 1,
+                       limits = c(0, 100), name = "Minority share (%)") +
+  labs(x = NULL,
+       y = "District (CPC difference)") +
+  theme_bw(base_size = 15) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+```
+
+
+```{r cpc-votes}
 # minority party vote inside each compact population-center district. These shapes can
 # overlap or leave gaps, so a precinct in an overlap contributes to more than one district.
 if (have_votes) {
-  cpc_estV <- st_intersection(precincts, cpc_districts) |>
+  
+  cpc_vote_fragments <- precincts |> 
+    st_union(select(cpc_districts, cpcDistrict)) |>
     st_make_valid() |> st_collection_extract("POLYGON") |>
     dplyr::filter(!st_is_empty(geom)) |>
     mutate(awTot   = totV * as.numeric(st_area(geom) / sarea),
-           awMinor = mpV  * as.numeric(st_area(geom) / sarea)) |>
+           awMinor = mpV  * as.numeric(st_area(geom) / sarea))
+  
+  cpc_vote_fragments |> st_write(here("data", "derived", "public", "Tennessee", "cpc_vote_fragments.gpkg"),
+                                 append = FALSE)
+    
+  cpc_estV <- cpc_vote_fragments |>
     st_drop_geometry() |>
+    filter(!is.na(cpcDistrict)) |> 
     group_by(cpcDistrict) |>
-    summarize(cpctotV = sum(awTot), cpcmpV = sum(awMinor), .groups = "drop")
+    summarize(cpctotV = sum(awTot), 
+              cpcmpV = sum(awMinor),
+              .groups = "drop")
 
   districts_results <- districts_results |>
     left_join(cpc_estV, by = c("DISTRICT" = "cpcDistrict")) |>
@@ -823,6 +1118,17 @@ if (have_votes) {
            cpcDiffV = pctMP - cpcPctV, cpcAbsDiffV = abs(cpcDiffV))
 }
 ```
+
+
+```{r save-districts}
+districts_results |> st_write(here("data", "derived", "public", "Tennessee", "district_results.gpkg"),
+                              append = FALSE)
+
+districts_results |> 
+  st_drop_geometry() |> 
+  write_csv(here("data", "derived", "public", "Tennessee", "district_results.csv"))
+```
+
 
 ```{r map-cpc, echo = FALSE, warning = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Compact population-center districts over the actual districts, ", params$state, ".")}
 ggplot() +

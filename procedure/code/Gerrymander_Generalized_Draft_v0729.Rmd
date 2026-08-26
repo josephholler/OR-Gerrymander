@@ -1024,6 +1024,14 @@ ggplot(districts_cpc_viz,
         panel.grid.minor = element_blank(),
         legend.position = "bottom")
 ```
+- Y-axis brackets: Delta C
+- Y-axis order: Delta C
+- X-axis: length proportional to population or votes
+- excluded: not inside district, but inside the equal-population circle, i.e. district boundaries were contorted to "exclude" this population from the district, perhaps unfairly
+- identity: inside the district AND inside the equal-population circle, i.e. composition of the part of the district that is most compact in shape. Even if composition is unusually high or low, this is a compact shape and likely fair. 
+- captured: inside the district, but NOT inside the equal-population circle, i.e. district boundaries were contorted to "capture" this population into the district, perhaps unfairly
+- Length of bar segments: total voting-age population
+- Color of bar segments: proportion of the segment that is a minority
 
 ```{r scatterplot_cpc_votes}
 ggplot(data = districts_results, mapping = aes(x = cpcIdentityPctV, y = cpcDiffV)) + 

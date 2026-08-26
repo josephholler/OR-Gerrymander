@@ -233,10 +233,13 @@ with a programmatic source when a local copy is not present.
 ```{r load-data, results = "hide"}
 # per-state data folder and file paths (edit names to match your files)
 state_slug      <- gsub("[^A-Za-z0-9]+", "_", params$state)
-data_dir        <- here("data", "raw", "public", state_slug)
+data_dir        <- here("data", "raw", "private", state_slug)
+output_dir      <- here("data", "derived", "private", state_slug)
 districts_file  <- here(data_dir, "districts.gpkg")   # a plan file, or fetched from TIGER
 blockgroup_file <- here(data_dir, "block_groups.gpkg")
 census_metadata_file <- here("data", "metadata", "census2020pl_vars.csv")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
 
 # precincts: use the Redistricting Data Hub "_all_" precinct shapefile found anywhere
 # under the state folder, or a file named precincts.shp; fall back if none is present
@@ -245,9 +248,6 @@ precincts_file  <- {
   if (!length(hits)) hits <- list.files(data_dir, pattern = "precincts\\.shp$", recursive = TRUE, full.names = TRUE)
   if (length(hits)) hits[1] else file.path(data_dir, "precincts.shp")
 }
-
-# output label: state alone, or state_plan when a plan is named
-result_set      <- state_slug
 
 # make sure the folders used to cache downloaded data exist
 dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
@@ -805,7 +805,7 @@ composition is measured with the voting-age population.
 
 ```{r save-load-race-fragments, warning = FALSE}
 race_fragments |> st_write(
-  here("data", "derived", "public", "Tennessee", "race_frags.gpkg"),
+  here(output_dir, "race_frags.gpkg"),
   append = FALSE
 )
 
@@ -877,7 +877,7 @@ cpc_excluded <- cpc_excluded |>
 # merge all three cases of CPCs together and save
 cpc_fragments <- bind_rows(cpc_identity, cpc_capture, cpc_excluded)
 
-cpc_fragments |> st_write(here("data", "derived", "public", "Tennessee", "cpc_fragments.gpkg"),
+cpc_fragments |> st_write(here(output_dir, "cpc_fragments.gpkg"),
                           append = FALSE)
 ```
 
@@ -904,7 +904,7 @@ cpc_cases <- cpc_fragments |>
             cpcmpV = sum(mpV)) |> 
   ungroup()
 
-cpc_cases |> st_write(here("data", "derived", "public", "Tennessee", "cpc_cases.gpkg"),
+cpc_cases |> st_write(here(output_dir, "cpc_cases.gpkg"),
                       append = FALSE)
 
 cpcd_identity <- cpc_cases |> 
@@ -951,7 +951,7 @@ cpc_districts <- bind_rows(cpc_excluded, cpc_identity) |>
   summarize() |> 
   left_join(cpc_est, by="cpcDistrict")
 
-cpc_districts |> st_write(here("data", "derived", "public", "Tennessee", "cpc_shapes.gpkg"),
+cpc_districts |> st_write(here(output_dir, "cpc_shapes.gpkg"),
                       append = FALSE)
 
 districts_results <- districts_results |>
@@ -1101,7 +1101,7 @@ if (have_votes) {
     mutate(awTot   = totV * as.numeric(st_area(geom) / sarea),
            awMinor = mpV  * as.numeric(st_area(geom) / sarea))
   
-  cpc_vote_fragments |> st_write(here("data", "derived", "public", "Tennessee", "cpc_vote_fragments.gpkg"),
+  cpc_vote_fragments |> st_write(here(output_dir, "cpc_vote_fragments.gpkg"),
                                  append = FALSE)
     
   cpc_estV <- cpc_vote_fragments |>
@@ -1126,7 +1126,7 @@ districts_results |> st_write(here("data", "derived", "public", "Tennessee", "di
 
 districts_results |> 
   st_drop_geometry() |> 
-  write_csv(here("data", "derived", "public", "Tennessee", "district_results.csv"))
+  write_csv(here(output_dir, "district_results.csv"))
 ```
 
 
@@ -1203,7 +1203,7 @@ tab |>
 
 ```{r save-results}
 out_dir <- here("data", "derived", "public", result_set)
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
 districts_results |> st_drop_geometry() |>
   write_csv(file.path(out_dir, "district_results.csv"))
 ```

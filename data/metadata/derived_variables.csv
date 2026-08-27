@@ -1,0 +1,15 @@
+﻿Label,Definition
+DISTRICT,Unique Congressional District ID number
+P3_001N,Total voting-age population
+Total,"Total voting-age population, same as P3_001N"
+TotalPop,"Total population, same as P1_001N"
+minority,Minority voting-age population: depends on header information. It is inclusive (i.e. includes people identifying as two or more races)
+pctMinority,"Minority composition of the census unit, calculated as minority / Total * 100"
+,
+,
+,
+frag_id,"unique id, based on row number, for each fragment resulting from the intersection of census geometries with districts"
+aw_Tot,area-weighted Total voting-age population
+awMinor,area-weighted total Minority population
+totV,total votes (Democrat + Republican)
+mpV,minority party votes (the party with fewer total votes in the state)

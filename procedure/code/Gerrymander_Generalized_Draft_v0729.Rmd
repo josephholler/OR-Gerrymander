@@ -4,6 +4,7 @@ author:
   - "1. Joseph Holler (josephh@middlebury.edu; corresponding author), Middlebury College"
   - "2. Peter Kedron (peterkedron@ucsb.edu), University of California, Santa Barbara"
   - "3. Pyung Kim (pyungkim@ucsb.edu), University of California, Santa Barbara"
+  - "4. Emily Zhou (ezhou@ucsb.edu), University of California, Santa Barbara"
 date: "`r Sys.Date()`"
 knit: (function(input, encoding) { p <- rmarkdown::yaml_front_matter(input)$params; rmarkdown::render(input, encoding = encoding, output_file = paste0("Gerrymander_", gsub("[^A-Za-z0-9]+", "_", paste(p$state, p$group, p$district_year)), ".html")) })
 output:
@@ -24,9 +25,14 @@ params:
   # A free Census API key must be installed once,
   # and the precinct election file must be downloaded by hand.
   # See "How to run this analysis" below.
-  state: "Tennessee"    # the state to analyze; type any U.S. state name here
-  group: "Black"        # group to analyze: a P3 race (Black, Asian, ...) or "Hispanic"
-  district_year: 2024   # congressional map year from TIGER; match your research question
+  state: "Tennessee"          # the state to analyze; type any U.S. state name here
+  group: "Black"              # group to analyze: a P3 race (Black, Asian, ...) or "Hispanic"
+  district_year: 2024         # congressional map year from TIGER; match your research question
+  resolution: "block group"   # "block" or "block group"
+  vote_year: 2024             # election year of the precinct file (matches the G<yr> code)
+  office: "PRE"               # office code in the vote columns (PRE president, USS senate, USH house)
+  minority_party: "auto"      # "auto" picks the statewide underdog; set "DEM" or "REP" to force the party to analyze
+  plan: ""                    # "" uses districts.gpkg or TIGER; or name a plan file in the state folder to use that map
 ---
 
 ```{=html}
@@ -115,7 +121,7 @@ gerrymandering and district shape.
 2. Choose `params$district_year` for your research purpose. To evaluate a particular
    election, use the year of the map that election was run under, since some states redrew
    their map mid-decade. You can also override TIGER entirely by placing a specific plan as
-   `districts.gpkg` in the state folder `data/raw/public/<state>/`.
+   `districts.gpkg` in the state folder `data/raw/private/<state>/`.
 3. Get a free Census API key at https://api.census.gov/data/key_signup.html and
    install it once by running `census_api_key("YOUR KEY", install = TRUE)` in the
    RStudio console, then restart R. This lets the document download census block
@@ -123,9 +129,10 @@ gerrymandering and district shape.
    files.
 4. To include the voting layer, download that state's "2024 General Election Precinct
    Boundaries and Election Results" from the Redistricting Data Hub and unzip it into
-   `data/raw/public/<state>/`. The code finds the `_all_` precinct shapefile inside that folder
-   automatically, so you can leave the downloaded folder as is. The congressional
-   districts and census block groups download automatically, so you do not need those.
+   `data/raw/private/<state>/`. Redistricting Data Hub data cannot be redistributed, so keep
+   the `private` folder out of the shared repo. The code finds the `_all_` precinct shapefile
+   inside that folder automatically, so you can leave the downloaded folder as is. The
+   congressional districts and census block groups download automatically, so you do not need those.
 5. Knit the document. The code reads `params$state` and loads that state's data.
 
 # 3 Materials and procedure
@@ -225,6 +232,10 @@ The `P3` variable metadata that labels which columns count as the minority group
 supporting lookup. It is downloaded automatically with `tidycensus::load_variables`
 and cached as `census2020pl_vars.csv`.
 
+This analysis uses precinct data from the Redistricting Data Hub, which asks that products
+built on their data carry the attribution "This map was created using data from the
+Redistricting Data Hub, redistrictingdatahub.org."
+
 ### 3.2.2 Loading the data
 
 We set the file paths from `params$state` and load each dataset, downloading the ones
@@ -233,13 +244,29 @@ with a programmatic source when a local copy is not present.
 ```{r load-data, results = "hide"}
 # per-state data folder and file paths (edit names to match your files)
 state_slug      <- gsub("[^A-Za-z0-9]+", "_", params$state)
+# all inputs live under private: RDH election data cannot be redistributed and block data
+# is too large to commit, so nothing here is committed to the shared repo
 data_dir        <- here("data", "raw", "private", state_slug)
-output_dir      <- here("data", "derived", "private", state_slug)
-districts_file  <- here(data_dir, "districts.gpkg")   # a plan file, or fetched from TIGER
-blockgroup_file <- here(data_dir, "block_groups.gpkg")
+geo             <- params$resolution                            # "block" or "block group"
+
+# result-set label encodes the analysis settings so 2+ runs of the same state do not
+# overwrite each other; it names the output folder and is recorded alongside the outputs
+result_parts <- c(params$state, params$group, params$district_year, params$resolution)
+if (nzchar(params$plan)) result_parts <- c(result_parts, params$plan)
+result_set   <- gsub("[^A-Za-z0-9]+", "_", paste(result_parts, collapse = " "))
+output_dir   <- here("data", "derived", "private", result_set)
+
+# districts: set params$plan to a file name in the state folder to analyze that specific map,
+# otherwise use districts.gpkg (if present) or the TIGER map for params$district_year
+districts_file  <- if (nzchar(params$plan)) file.path(data_dir, params$plan) else file.path(data_dir, "districts.gpkg")
+blockgroup_file <- file.path(data_dir, if (geo == "block") "block.gpkg" else "block_groups.gpkg")
 census_metadata_file <- here("data", "metadata", "census2020pl_vars.csv")
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+
+# record the run settings (a copy of the header params) inside the result folder
+writeLines(vapply(names(params), function(k) paste0(k, ": ", params[[k]]), character(1)),
+           file.path(output_dir, "run_params.txt"))
 
 # precincts: use the Redistricting Data Hub "_all_" precinct shapefile found anywhere
 # under the state folder, or a file named precincts.shp; fall back if none is present
@@ -278,14 +305,14 @@ if (file.exists(census_metadata_file)) {
 if (file.exists(blockgroup_file)) {
   blockgroups <- st_read(blockgroup_file)
 } else {
-  blockgroups <- get_decennial(geography = "block", sumfile = "pl", table = "P3",
+  blockgroups <- get_decennial(geography = geo, sumfile = "pl", table = "P3",
                                year = 2020, state = params$state, output = "wide",
                                geometry = TRUE, keep_geo_vars = TRUE)
   # Hispanic or Latino ethnicity (table P4), for the group = "Hispanic" option
-  hisp <- get_decennial(geography = "block", sumfile = "pl", table = "P4",
+  hisp <- get_decennial(geography = geo, sumfile = "pl", table = "P4",
                         year = 2020, state = params$state, output = "wide")
   # total population of all ages, used later to size the compact districts
-  totalpop <- get_decennial(geography = "block", sumfile = "pl",
+  totalpop <- get_decennial(geography = geo, sumfile = "pl",
                             variables = "P1_001N", year = 2020, state = params$state,
                             output = "wide")
   blockgroups <- blockgroups |>
@@ -297,7 +324,7 @@ if (file.exists(blockgroup_file)) {
 # if a cached file predates Hispanic support, fetch table P4 on demand (also used by the
 # full race and ethnicity composition table)
 if (!"P4_002N" %in% names(blockgroups)) {
-  hisp <- get_decennial(geography = "block group", sumfile = "pl", table = "P4",
+  hisp <- get_decennial(geography = geo, sumfile = "pl", table = "P4",
                         year = 2020, state = params$state, output = "wide")
   blockgroups <- left_join(blockgroups, dplyr::select(hisp, GEOID, dplyr::starts_with("P4_")),
                            by = "GEOID")
@@ -403,21 +430,30 @@ blockgroups_calc <- blockgroups |>
   dplyr::select(GEOID, sarea, minority, Total, TotalPop, pctMinority, CheckPct)
 ```
 
-For the precincts we compute `totV`, the two-party presidential total, and `mpV`, the
-minority party vote. The majority and minority party designations are state specific,
-so we choose the minority party automatically as the statewide underdog, the party
-with fewer total votes.
+For the precincts we compute `totV`, the two-party total for the election named by
+`params$office` and `params$vote_year`, and `mpV`, the minority party vote. The minority
+party is the statewide underdog by default, the party with fewer total votes, or the
+party forced by `params$minority_party`.
 
 ```{r precinct-vars}
 if (have_votes) {
-  # 2024 two-party presidential columns, detected by name
-  # (Republican G24PRER*, Democratic G24PRED*)
-  rep_cols <- grep("^G24PRER", names(precincts), value = TRUE)
-  dem_cols <- grep("^G24PRED", names(precincts), value = TRUE)
+  # vote columns follow the RDH code G<yr><office><party>..., e.g. G24PRER for a 2024
+  # presidential Republican. We pick them by position from the params rather than a fixed
+  # string: year is characters 2-3, office is 4-6, party is the 7th character (R or D).
+  yr2 <- substr(as.character(params$vote_year), 3, 4)
+  nm  <- names(precincts)
+  sel <- substr(nm, 1, 1) == "G" &
+         substr(nm, 2, 3) == yr2 &
+         substr(nm, 4, 6) == toupper(params$office)
+  rep_cols <- nm[sel & substr(nm, 7, 7) == "R"]
+  dem_cols <- nm[sel & substr(nm, 7, 7) == "D"]
 
+  # minority party: forced by params$minority_party, or the statewide underdog when "auto"
   Rtot <- sum(rowSums(st_drop_geometry(precincts)[rep_cols]), na.rm = TRUE)
   Dtot <- sum(rowSums(st_drop_geometry(precincts)[dem_cols]), na.rm = TRUE)
-  minority_party <- if (Dtot <= Rtot) "Democratic" else "Republican"
+  minority_party <- if (toupper(params$minority_party) == "DEM") "Democratic"
+                    else if (toupper(params$minority_party) == "REP") "Republican"
+                    else if (Dtot <= Rtot) "Democratic" else "Republican"
   mp_cols <- if (minority_party == "Democratic") dem_cols else rep_cols
 
   precincts <- precincts |>
@@ -454,8 +490,15 @@ if (have_votes) {
     mutate(totV = coalesce(totV, 0),
            mpV = coalesce(mpV, 0))
 }
+
+# ensure vote columns exist even without precincts, so downstream code does not break
+if (!have_votes) {
+  blockgroups_calc$totV <- 0
+  blockgroups_calc$mpV  <- 0
+}
 ```
 
+`r if (have_votes) paste0("For this run the statewide minority party is the ", minority_party, " party, based on the ", params$vote_year, " ", params$office, " election.") else "No precinct data is loaded, so the partisan analysis is skipped for this run."`
 
 ### 3.3.3 Descriptive statistics (racial and ethnic composition by district)
 
@@ -545,11 +588,12 @@ district lines. When a district line wraps tightly around a cluster, that is a v
 packing, and when a line cuts a cluster into several districts, that is a visual sign of cracking.
 
 
-# Disabled section
+This map is shown only at coarser resolutions. At block level there are too many tiny
+units to sample and render, so it is skipped automatically.
 
-Dot density mapping becomes infeasible with large data and small enumeration areas.
-
-```
+```{r map-dots-setup, include = FALSE}
+# dot density is only feasible at coarse units; skip it automatically for block-level data
+do_dots <- geo != "block"
 set.seed(1)
 dot_people <- 1000   # people per dot (voting age); raise this to speed up rendering
 bg_dots <- blockgroups |> dplyr::filter(!st_is_empty(geom))
@@ -567,8 +611,7 @@ sample_dots <- function(bg, cols) {
 }
 ```
 
-```
-{map-dots-group, eval = FALSE,  echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
+```{r map-dots-group, eval = do_dots, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
 if (tolower(params$group) == "hispanic") {
   bg_dots$grp <- bg_dots$P4_002N
 } else {
@@ -799,7 +842,7 @@ composition is measured with the voting-age population.
 
 ```{r save-load-race-fragments, warning = FALSE}
 race_fragments |> st_write(
-  here(output_dir, "race_frags.gpkg"),
+  file.path(output_dir, "race_frags.gpkg"),
   append = FALSE
 )
 
@@ -871,7 +914,7 @@ cpc_excluded <- cpc_excluded |>
 # merge all three cases of CPCs together and save
 cpc_fragments <- bind_rows(cpc_identity, cpc_capture, cpc_excluded)
 
-cpc_fragments |> st_write(here(output_dir, "cpc_fragments.gpkg"),
+cpc_fragments |> st_write(file.path(output_dir, "cpc_fragments.gpkg"),
                           append = FALSE)
 ```
 
@@ -898,7 +941,7 @@ cpc_cases <- cpc_fragments |>
             cpcmpV = sum(mpV)) |> 
   ungroup()
 
-cpc_cases |> st_write(here(output_dir, "cpc_cases.gpkg"),
+cpc_cases |> st_write(file.path(output_dir, "cpc_cases.gpkg"),
                       append = FALSE)
 
 cpcd_identity <- cpc_cases |> 
@@ -945,7 +988,7 @@ cpc_districts <- bind_rows(cpc_excluded, cpc_identity) |>
   summarize() |> 
   left_join(cpc_est, by="cpcDistrict")
 
-cpc_districts |> st_write(here(output_dir, "cpc_shapes.gpkg"),
+cpc_districts |> st_write(file.path(output_dir, "cpc_shapes.gpkg"),
                       append = FALSE)
 
 districts_results <- districts_results |>
@@ -1069,11 +1112,11 @@ ggplot(districts_cpc_viz,
            ymin = rank - 0.35, ymax = rank + 0.35,
            fill = pct_minority)) +
   geom_rect(color = "white", linewidth = 0.4) +
-  geom_text(data = dplyr::filter(districts_cpc_viz, segment == "cpcidTotV"),
+  geom_text(data = dplyr::filter(districts_cpc_viz, segment == "cpcidtotV"),
             aes(x = (xmin + xmax) / 2,
                 label = paste0(round(cpcIdentityPctV, 1), "%")),
             inherit.aes = FALSE, y = districts_cpc_viz$rank[
-              districts_cpc_viz$segment == "cpcidTotV"],
+              districts_cpc_viz$segment == "cpcidtotV"],
             color = "white", fontface = "bold") +
   scale_y_reverse(breaks = unique(districts_cpc_viz$rank),
                   labels = districts_cpc_viz$district_label[match(
@@ -1092,12 +1135,12 @@ ggplot(districts_cpc_viz,
 
 
 ```{r save-districts}
-districts_results |> st_write(here(output_dir, "district_results.gpkg"),
+districts_results |> st_write(file.path(output_dir, "district_results.gpkg"),
                               append = FALSE)
 
 districts_results |> 
   st_drop_geometry() |> 
-  write_csv(here(output_dir, "district_results.csv"))
+  write_csv(file.path(output_dir, "district_results.csv"))
 ```
 
 

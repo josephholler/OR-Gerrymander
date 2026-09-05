@@ -6,7 +6,7 @@ author:
   - "3. Pyung Kim (pyungkim@ucsb.edu), University of California, Santa Barbara"
   - "4. Emily Zhou (ezhou@ucsb.edu), University of California, Santa Barbara"
 date: "`r Sys.Date()`"
-knit: (function(input, encoding) { p <- rmarkdown::yaml_front_matter(input)$params; rmarkdown::render(input, encoding = encoding, output_file = paste0("Gerrymander_", gsub("[^A-Za-z0-9]+", "_", paste(p$state, p$group, p$district_year)), ".html")) })
+knit: (function(input, encoding) { p <- rmarkdown::yaml_front_matter(input)$params; parts <- c(p$state, p$group, p$office, p$focal_party, p$resolution, p$district_year, if (as.character(p$vote_year) != as.character(p$district_year)) p$vote_year, if (nzchar(p$plan)) p$plan); rmarkdown::render(input, encoding = encoding, output_file = paste0("Gerrymander_", gsub("[^A-Za-z0-9]+", "_", paste(parts, collapse = " ")), ".html")) })
 output:
   bookdown::html_document2:
     code_folding: hide
@@ -25,14 +25,32 @@ params:
   # A free Census API key must be installed once,
   # and the precinct election file must be downloaded by hand.
   # See "How to run this analysis" below.
-  state: "Tennessee"          # the state to analyze; type any U.S. state name here
-  group: "Black"              # group to analyze: a P3 race (Black, Asian, ...) or "Hispanic"
-  district_year: 2024         # congressional map year from TIGER; match your research question
-  resolution: "block group"   # "block" or "block group"
-  vote_year: 2024             # election year of the precinct file (matches the G<yr> code)
-  office: "PRE"               # office code in the vote columns (PRE president, USS senate, USH house)
-  minority_party: "auto"      # "auto" picks the statewide underdog; set "DEM" or "REP" to force the party to analyze
-  plan: ""                    # "" uses districts.gpkg or TIGER; or name a plan file in the state folder to use that map
+  state: "Tennessee"          # options. any U.S. state name (e.g. "Tennessee").
+                              # the state to analyze.
+  group: "Black"              # options. a race, "Hispanic", or "coalition".
+                              #   a race is matched by census label, so use "White", "Black",
+                              #   "Asian", "American Indian", "Native Hawaiian", or "Some Other Race".
+                              #   "Hispanic" is Hispanic of any race;
+                              #   "coalition" is everyone except non-Hispanic White alone.
+                              # the group to analyze.
+  counting: "alone"           # options. "alone" or "combination".
+                              #   single race only; ignored for "Hispanic" and "coalition".
+                              # "alone" counts that race by itself, on the voting-age population.
+                              # "combination" counts it alone or in combination with other races,
+                              # from the 2020 DHC file. That count exists only for the total
+                              # population, so "combination" reports this group on the
+                              # total-population basis (not voting age).
+  district_year: 2024         # options. a congressional map year from TIGER (e.g. 2024).
+                              # match your research question.
+  resolution: "block group"   # options. "block" or "block group".
+  vote_year: 2024             # options. the election year of the precinct file
+                              # (matches the G<yr> code, e.g. 2024).
+  office: "PRE"               # options. "PRE" president, "USS" senate, "USH" house.
+                              # the office code in the vote columns.
+  focal_party: "auto"         # options. "auto", "DEM", or "REP". the focal party to analyze.
+                              # "auto" picks the statewide underdog; "DEM"/"REP" force it.
+  plan: ""                    # options. "" or a plan file name in the state folder.
+                              # "" uses districts.gpkg or TIGER; a name uses that map.
 ---
 
 ```{=html}
@@ -104,6 +122,14 @@ reference shapes derived from it. These reference shapes are its convex hull, it
 minimum bounding circle, and a compact district grown from its population-weighted
 mean center.
 
+Our contribution is methodological and geographic rather than a claim about political
+science theory. Most geometric measures judge a district by the compactness of its shape
+alone. We instead introduce a composition difference (ΔC) that couples a district's racial
+or partisan composition with the geometry of compact reference shapes, and we implement it
+as a reproducible workflow that runs for any U.S. state from standard public data. Framing
+gerrymandering this way connects it to long-standing geographic concerns with the
+modifiable areal unit problem, scale, and edge effects.
+
 ## 1.2 Bias and threats to validity
 
 This study is explicitly an investigation into the modifiable areal unit problem.
@@ -148,8 +174,8 @@ The setup chunk installs any missing package so the analysis runs on a clean mac
 options(scipen = 999, digits = 3)
 
 # packages used in this analysis
-packages <- c("tidyverse", "here", "sf", "lwgeom",
-              "tidycensus", "tigris", "knitr", "kableExtra", "ggtext", "bookdown")
+packages <- c("tidyverse", "here", "sf", "lwgeom", "geosphere",
+              "tidycensus", "tigris", "knitr", "kableExtra", "ggtext", "patchwork", "bookdown")
 
 # install any that are missing, then load them
 for (p in packages) {
@@ -178,9 +204,10 @@ style_tbl <- function(kb) {
     kableExtra::row_spec(0, bold = TRUE, color = "white", background = "#3B6B7A")
 }
 
-# color for Cdiff cells, matching the maps and bars: packing (positive) red,
-# cracking (negative) blue, near-zero grey
-diff_color <- function(x) ifelse(x > 0, "#C0405E", ifelse(x < 0, "#3E7EA0", "#555555"))
+# color for Delta-C cells, matching the maps and bars: concentration (positive) red,
+# dilution (negative) blue, near-zero grey
+diff_color <- function(x) ifelse(is.na(x), "#555555",
+                          ifelse(x > 0, "#C0405E", ifelse(x < 0, "#3E7EA0", "#555555")))
 
 # one color per reference shape, used to tint the facet strip labels (figures)
 # and the grouped column headers (tables): hull green, circle pink, center orange
@@ -224,9 +251,18 @@ precinct data must be downloaded by hand.
   for the year of interest (for example 2024) and download the shapefile. Vote
   columns follow the `G<yr>PRE<party><cand>` naming convention, for example
   `G24PRERTRU` for 2024 presidential votes for the Republican candidate.
-- **Census block groups.** Population 18 years and older by race, from the 2020
-  Census PL 94-171 redistricting file, table `P3`, downloaded automatically with the
-  `tidycensus` package. Block group geometry is included in the same download.
+- **Census block groups.** Population by race and Hispanic ethnicity, from the 2020
+  Census PL 94-171 redistricting file, downloaded automatically with the `tidycensus`
+  package: table `P3` (race, 18 and over), `P4` (Hispanic origin by race, 18 and over),
+  `P2` (Hispanic origin by race, total population), and `P1` (total population). Block
+  group geometry is included in the same download.
+- **Race alone or in combination (only when `params$counting` is "combination").** The
+  count of the group counted alone or in combination with one or more other races, read
+  from the 2020 Census Demographic and Housing Characteristics (DHC) file, table `P7`,
+  downloaded automatically with `tidycensus`. This is needed because the PL 94-171 file
+  above reports only race-alone counts, so an inclusive count has no source there. The
+  DHC publishes it for the total population and not for voting age, which is why the
+  "combination" option reports the group on the total-population basis.
 
 The `P3` variable metadata that labels which columns count as the minority group is a
 supporting lookup. It is downloaded automatically with `tidycensus::load_variables`
@@ -251,7 +287,12 @@ geo             <- params$resolution                            # "block" or "bl
 
 # result-set label encodes the analysis settings so 2+ runs of the same state do not
 # overwrite each other; it names the output folder and is recorded alongside the outputs
-result_parts <- c(params$state, params$group, params$district_year, params$resolution)
+# encode every setting that changes the output, in the same order as the HTML file name,
+# so two runs that differ in any of them do not overwrite each other
+result_parts <- c(params$state, params$group, params$office, params$focal_party,
+                  params$resolution, params$district_year)
+if (as.character(params$vote_year) != as.character(params$district_year))
+  result_parts <- c(result_parts, params$vote_year)
 if (nzchar(params$plan)) result_parts <- c(result_parts, params$plan)
 result_set   <- gsub("[^A-Za-z0-9]+", "_", paste(result_parts, collapse = " "))
 output_dir   <- here("data", "derived", "private", result_set)
@@ -263,6 +304,45 @@ blockgroup_file <- file.path(data_dir, if (geo == "block") "block.gpkg" else "bl
 census_metadata_file <- here("data", "metadata", "census2020pl_vars.csv")
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Tables and figures are written to the shared data/output folder (data itself goes to
+# the derived result folder above). Figures are named "Figure N <title>"; the number is a
+# running count that follows the order figures appear, matching the report numbering.
+output_report_dir <- here("data", "output")
+dir.create(output_report_dir, recursive = TRUE, showWarnings = FALSE)
+# clear stale "Figure N ..."/"Table N ..." files from an earlier run so a run that produces
+# fewer or differently titled outputs does not leave orphans (only our own naming pattern
+# is matched, so nothing else in the folder is touched)
+unlink(list.files(output_report_dir,
+                  pattern = "^(Figure|Table) [0-9]+ .*\\.(png|csv)$", full.names = TRUE))
+knitr::opts_chunk$set(fig.path = file.path(output_report_dir, ""))
+
+# make a caption filesystem-safe (drop punctuation such as the ΔC glyph and colons)
+clean_title <- function(x) {
+  x <- gsub("[^A-Za-z0-9 ]+", " ", x)
+  substr(gsub("\\s+", " ", trimws(x)), 1, 90)
+}
+
+# rename each rendered figure to "Figure N <title>.png" as knitr writes it
+.fig_counter <- 0L
+knitr::opts_chunk$set(fig.process = function(path, options) {
+  .fig_counter <<- .fig_counter + 1L
+  cap <- options$fig.cap
+  if (is.null(cap) || !nzchar(cap)) cap <- options$label
+  dest <- file.path(output_report_dir, sprintf("Figure %d %s.png", .fig_counter, clean_title(cap)))
+  ok <- suppressWarnings(try(file.rename(path, dest), silent = TRUE))
+  if (inherits(ok, "try-error") || !isTRUE(ok)) return(path)
+  dest
+})
+
+# write each table to data/output as "Table N <title>.csv", counted in appearance order
+.tab_counter <- 0L
+save_output_table <- function(df, title) {
+  .tab_counter <<- .tab_counter + 1L
+  f <- file.path(output_report_dir, sprintf("Table %d %s.csv", .tab_counter, clean_title(title)))
+  try(readr::write_csv(as.data.frame(df), f), silent = TRUE)
+  invisible(df)
+}
 
 # record the run settings (a copy of the header params) inside the result folder
 writeLines(vapply(names(params), function(k) paste0(k, ": ", params[[k]]), character(1)),
@@ -300,34 +380,52 @@ if (file.exists(census_metadata_file)) {
   write.csv(census2020pl_vars, census_metadata_file)
 }
 
-# census block groups: P3 (race for 18+), P4 (Hispanic ethnicity for 18+), and P1_001N
-# (total population all ages); cached, or queried and cached
+# census block groups: P3 (race for 18+), P4 (Hispanic ethnicity for 18+, voting age),
+# P2 (Hispanic ethnicity for all ages, total population), and P1_001N (total population
+# all ages); cached, or queried and cached
 if (file.exists(blockgroup_file)) {
   blockgroups <- st_read(blockgroup_file)
 } else {
   blockgroups <- get_decennial(geography = geo, sumfile = "pl", table = "P3",
                                year = 2020, state = params$state, output = "wide",
                                geometry = TRUE, keep_geo_vars = TRUE)
-  # Hispanic or Latino ethnicity (table P4), for the group = "Hispanic" option
-  hisp <- get_decennial(geography = geo, sumfile = "pl", table = "P4",
-                        year = 2020, state = params$state, output = "wide")
+  # Hispanic or Latino ethnicity by race: voting age (table P4) and all ages (table P2).
+  # P2 mirrors P4 category by category, so it gives the same groups on the total population.
+  hisp     <- get_decennial(geography = geo, sumfile = "pl", table = "P4",
+                            year = 2020, state = params$state, output = "wide")
+  hisp_tot <- get_decennial(geography = geo, sumfile = "pl", table = "P2",
+                            year = 2020, state = params$state, output = "wide")
   # total population of all ages, used later to size the compact districts
   totalpop <- get_decennial(geography = geo, sumfile = "pl",
                             variables = "P1_001N", year = 2020, state = params$state,
                             output = "wide")
   blockgroups <- blockgroups |>
     left_join(dplyr::select(hisp, GEOID, dplyr::starts_with("P4_")), by = "GEOID") |>
+    left_join(dplyr::select(hisp_tot, GEOID, dplyr::starts_with("P2_")), by = "GEOID") |>
     left_join(dplyr::select(totalpop, GEOID, P1_001N), by = "GEOID")
   st_write(blockgroups, blockgroup_file)
 }
 
-# if a cached file predates Hispanic support, fetch table P4 on demand (also used by the
-# full race and ethnicity composition table)
-if (!"P4_002N" %in% names(blockgroups)) {
+# an older cached file may hold only some P4 columns; ensure the full P4 table is present
+needed_p4 <- c("P4_001N", "P4_002N", "P4_005N", "P4_006N", "P4_007N",
+               "P4_008N", "P4_009N", "P4_010N", "P4_011N")
+if (!all(needed_p4 %in% names(blockgroups))) {
   hisp <- get_decennial(geography = geo, sumfile = "pl", table = "P4",
                         year = 2020, state = params$state, output = "wide")
-  blockgroups <- left_join(blockgroups, dplyr::select(hisp, GEOID, dplyr::starts_with("P4_")),
-                           by = "GEOID")
+  blockgroups <- blockgroups |>
+    dplyr::select(-dplyr::any_of(grep("^P4_", names(blockgroups), value = TRUE))) |>
+    left_join(dplyr::select(hisp, GEOID, dplyr::starts_with("P4_")), by = "GEOID")
+}
+
+# likewise ensure the full P2 (total-population) table is present in an older cache
+needed_p2 <- c("P2_001N", "P2_002N", "P2_005N", "P2_006N", "P2_007N",
+               "P2_008N", "P2_009N", "P2_010N", "P2_011N")
+if (!all(needed_p2 %in% names(blockgroups))) {
+  hisp_tot <- get_decennial(geography = geo, sumfile = "pl", table = "P2",
+                            year = 2020, state = params$state, output = "wide")
+  blockgroups <- blockgroups |>
+    dplyr::select(-dplyr::any_of(grep("^P2_", names(blockgroups), value = TRUE))) |>
+    left_join(dplyr::select(hisp_tot, GEOID, dplyr::starts_with("P2_")), by = "GEOID")
 }
 ```
 
@@ -360,11 +458,16 @@ if (have_votes) {
   st_geometry(precincts) <- "geom"
 }
 
-# state aspect ratio (height / width), used to size maps so they do not leave whitespace
-.bb <- st_bbox(districts)
+# aspect ratio (height / width) of any layer's bounding box, used to size maps so they do
+# not leave whitespace. Reference shapes such as bounding circles extend past the state, so
+# each of those maps is sized to its own extent rather than the state's.
+bbox_asp <- function(x) {
+  b <- st_bbox(x)
+  as.numeric((b["ymax"] - b["ymin"]) /
+             ((b["xmax"] - b["xmin"]) * cospi(mean(c(b["ymin"], b["ymax"])) / 180)))
+}
 map_w   <- 8   # map width in inches
-map_asp <- as.numeric((.bb["ymax"] - .bb["ymin"]) /
-                      ((.bb["xmax"] - .bb["xmin"]) * cospi(mean(c(.bb["ymin"], .bb["ymax"])) / 180)))
+map_asp <- bbox_asp(districts)
 ```
 
 
@@ -378,28 +481,83 @@ ggplot(districts) +
 ### 3.3.2 Compute variables of interest
 
 We compute the percentage of the population 18 years and older that belongs to the group
-named by `params$group`. For a race such as Black or Asian we select the `P3` variables
-whose label names that group, counting anyone who identifies with that category alone or
-in combination with any other race. For Hispanic or Latino, which the census treats as an
-ethnicity rather than a race, we use the `P4` table instead.
+named by `params$group`, using table P4, which breaks race out on the not-Hispanic side. For a
+race such as Black or Asian, `params$counting` chooses whether to count people who report that
+race alone (exclusive) or alone or in combination with another race (inclusive). The
+alone-or-in-combination count is published only for the total population (from the 2020 DHC
+file), so choosing `combination` reports that group on the total population rather than the
+voting-age population. For Hispanic or Latino we use the Hispanic total of any race, and for
+`coalition` we count everyone except non-Hispanic White alone.
 
 ```{r minority-vars}
-group_label <- params$group   # a P3 race (e.g. Black, Asian) or "Hispanic" from table P4
+group_label <- params$group           # a race (Black, Asian, ...), "Hispanic", or "coalition"
+counting <- tolower(params$counting)   # "alone" (exclusive) or "combination" (inclusive)
+total_basis <- FALSE                   # combination reports the group on the total population
 
-if (tolower(group_label) == "hispanic") {
-  # Hispanic or Latino, population 18 and over (table P4, variable P4_002N)
+if (tolower(group_label) == "coalition") {
+  # all minorities: everyone except non-Hispanic White alone (P4_001N - P4_005N),
+  # written as the sum of the non-White P4 categories
+  minority_vars <- census2020pl_vars |>
+    dplyr::filter(name %in% c("P4_002N", "P4_006N", "P4_007N", "P4_008N",
+                              "P4_009N", "P4_010N", "P4_011N")) |>
+    dplyr::select(name, label)
+} else if (tolower(group_label) == "hispanic") {
+  # Hispanic or Latino of any race, population 18 and over (P4_002N)
   minority_vars <- census2020pl_vars |>
     dplyr::filter(name == "P4_002N") |>
     dplyr::select(name, label)
+} else if (counting == "combination") {
+  # alone-or-in-combination is published only for the TOTAL population (2020 DHC tables
+  # P6/P7), not for voting age, so "combination" switches this group to the total-population
+  # basis. We use the not-Hispanic "alone or in combination" count (table P7) for the group,
+  # fetched from DHC and joined to the block groups.
+  aoic_var <- NA_character_
+  try({
+    dhc_vars <- load_variables(2020, "dhc")
+    aoic <- dhc_vars |>
+      dplyr::filter(str_detect(tolower(label), "alone or in combination"),
+                    str_detect(label, "Not Hispanic"),
+                    str_detect(label, group_label))
+    aoic_var <- aoic$name[1]
+    if (!is.na(aoic_var) && !aoic_var %in% names(blockgroups)) {
+      aoic_bg <- get_decennial(geography = geo, sumfile = "dhc", variables = aoic_var,
+                               year = 2020, state = params$state, output = "wide")
+      blockgroups <- blockgroups |>
+        left_join(dplyr::select(aoic_bg, GEOID, dplyr::all_of(aoic_var)), by = "GEOID")
+    }
+  }, silent = TRUE)
+  if (!is.na(aoic_var) && aoic_var %in% names(blockgroups)) {
+    minority_vars <- data.frame(name = aoic_var, label = aoic$label[1],
+                                stringsAsFactors = FALSE)
+    total_basis <- TRUE
+  } else {
+    warning("DHC alone-or-in-combination is not available for ", group_label,
+            "; falling back to 'alone' on the voting-age population.")
+    minority_vars <- census2020pl_vars |>
+      dplyr::filter(str_detect(name, "^P4"), str_detect(label, group_label),
+                    str_detect(label, "alone")) |>
+      dplyr::select(name, label)
+  }
 } else {
-  # a race category, population 18 and over (table P3, alone or in combination)
+  # a single race counted alone, from the not-Hispanic P4 categories (voting age)
   minority_vars <- census2020pl_vars |>
-    dplyr::filter(str_detect(name, "^P3"), str_detect(label, group_label)) |>
+    dplyr::filter(str_detect(name, "^P4"), str_detect(label, group_label),
+                  str_detect(label, "alone")) |>
     dplyr::select(name, label)
 }
+
+# the same group on the total population of all ages, using the parallel P2 codes.
+# P2 mirrors P4 category by category (P4_006N is Black alone at 18+, P2_006N is Black alone
+# at all ages). The sub() is a no-op when combination already uses a total-population variable.
+minority_vars_tot <- minority_vars |>
+  dplyr::mutate(name = sub("^P4_", "P2_", name))
+
+# the population basis this run reports the group on, named in captions and prose below
+basis_word <- if (total_basis) "total population" else "voting-age population"
 ```
 
 ```{r table1, echo = FALSE}
+save_output_table(minority_vars, "Selected census variables for the group of interest")
 minority_vars |>
   rename(Variable = name, Label = label) |>
   kbl(caption = "Selected census variables for the group of interest.") |>
@@ -407,35 +565,35 @@ minority_vars |>
   scroll_box(height = "300px")
 ```
 
-For each block group we sum the selected columns into `minority`, copy the 18-and-over
-total (`P3_001N`) into `Total`, and compute `pctMinority`. `CheckPct` is the share of
-the population that is either White alone or the minority group, which should be near
-100 percent unless other minority groups are large. We also compute the area of each
-block group for later area-weighted reaggregation.
+For each block group we sum the selected columns into `minority`, use the matching population
+total as `pop_basis` (the voting-age `P3_001N`, or the total population `P1_001N` when counting is
+combination), and compute `pctMinority`. We keep the all-ages total as `pop_total`, and compute
+the area of each block group for later area-weighted reaggregation.
 
 ```{r bg-vars}
-# fall back to voting-age population if total population is absent (older cached file)
-if (!"P1_001N" %in% names(blockgroups)) blockgroups$P1_001N <- blockgroups$P3_001N
-
 blockgroups_calc <- blockgroups |>
   dplyr::filter(!st_is_empty(geom)) |>
   rowwise() |>
-  mutate(minority = sum(c_across(all_of(minority_vars$name)))) |>
+  mutate(minority = sum(c_across(all_of(minority_vars$name))),         # numerator on the run basis
+         minority_tot = sum(c_across(all_of(minority_vars_tot$name)))) |>  # all ages (P2)
   ungroup() |>
   mutate(sarea = st_area(geom),
-         Total = P3_001N,     # voting-age population (18+), used for composition
-         TotalPop = P1_001N,  # all ages, used to size the compact districts
-         pctMinority = minority / Total * 100,
-         CheckPct = (minority + P3_003N) / Total * 100) |>
-  dplyr::select(GEOID, sarea, minority, Total, TotalPop, pctMinority, CheckPct)
+         # pop_basis is the analysis denominator on the run's basis: voting-age (P3_001N)
+         # normally, or total population (P1_001N) when counting is "combination", so the
+         # numerator and denominator share one basis. pop_total is always the all-ages total.
+         pop_basis = if (total_basis) P1_001N else P3_001N,
+         pop_total = P1_001N,  # all ages, used to size the compact districts and total-pop composition
+         pctMinority = minority / pop_basis * 100) |>
+  dplyr::select(GEOID, sarea, minority, minority_tot, pop_basis, pop_total, pctMinority)
 ```
 
 For the precincts we compute `totV`, the two-party total for the election named by
-`params$office` and `params$vote_year`, and `mpV`, the minority party vote. The minority
+`params$office` and `params$vote_year`, and `mpV`, the focal party vote. The focal
 party is the statewide underdog by default, the party with fewer total votes, or the
-party forced by `params$minority_party`.
+party forced by `params$focal_party`.
 
 ```{r precinct-vars}
+fp_disp <- "focal party"   # default caption label; replaced with the party name when votes load
 if (have_votes) {
   # vote columns follow the RDH code G<yr><office><party>..., e.g. G24PRER for a 2024
   # presidential Republican. We pick them by position from the params rather than a fixed
@@ -448,13 +606,27 @@ if (have_votes) {
   rep_cols <- nm[sel & substr(nm, 7, 7) == "R"]
   dem_cols <- nm[sel & substr(nm, 7, 7) == "D"]
 
-  # minority party: forced by params$minority_party, or the statewide underdog when "auto"
+  # if the chosen office is not present in this precinct file, skip the partisan analysis
+  # rather than build empty vote columns (e.g. House races are coded per district, not as a
+  # single statewide R/D pair)
+  if (length(rep_cols) == 0 || length(dem_cols) == 0) {
+    warning("No vote columns match office = ", params$office,
+            "; skipping the partisan analysis for this run.")
+    have_votes <- FALSE
+  }
+}
+
+if (have_votes) {
+  # focal party: forced by params$focal_party, or the statewide underdog when "auto"
   Rtot <- sum(rowSums(st_drop_geometry(precincts)[rep_cols]), na.rm = TRUE)
   Dtot <- sum(rowSums(st_drop_geometry(precincts)[dem_cols]), na.rm = TRUE)
-  minority_party <- if (toupper(params$minority_party) == "DEM") "Democratic"
-                    else if (toupper(params$minority_party) == "REP") "Republican"
-                    else if (Dtot <= Rtot) "Democratic" else "Republican"
-  mp_cols <- if (minority_party == "Democratic") dem_cols else rep_cols
+  focal_party <- if (toupper(params$focal_party) == "DEM") "Democratic"
+                 else if (toupper(params$focal_party) == "REP") "Republican"
+                 else if (Dtot <= Rtot) "Democratic" else "Republican"
+  mp_cols <- if (focal_party == "Democratic") dem_cols else rep_cols
+
+  # label for figure captions and legends, naming the actual party, e.g. "focal party (Democratic)"
+  fp_disp <- paste0("focal party (", focal_party, ")")
 
   precincts <- precincts |>
     mutate(totV = rowSums(across(all_of(c(rep_cols, dem_cols)))),
@@ -472,9 +644,9 @@ if (have_votes) {
       mutate(precinct_id = dplyr::row_number()) |>
       dplyr::select(precinct_id, totV, mpV),
     blockgroups_calc |>
-      dplyr::select(GEOID, Total, sarea)
+      dplyr::select(GEOID, pop_basis, sarea)
   ) |>
-    mutate(bg_weight = Total * as.numeric(st_area(geom) / sarea),
+    mutate(bg_weight = pop_basis * as.numeric(st_area(geom) / sarea),
            prec_totV = totV,
            prec_mpV = mpV) |>
     group_by(precinct_id) |>
@@ -498,86 +670,217 @@ if (!have_votes) {
 }
 ```
 
-`r if (have_votes) paste0("For this run the statewide minority party is the ", minority_party, " party, based on the ", params$vote_year, " ", params$office, " election.") else "No precinct data is loaded, so the partisan analysis is skipped for this run."`
+`r if (have_votes) paste0("For this run the focal party is the ", focal_party, " party, based on the ", params$vote_year, " ", params$office, " election.") else "The partisan analysis is skipped for this run, because no precinct file is present or the chosen office is not in that file."`
 
 ### 3.3.3 Descriptive statistics (racial and ethnic composition by district)
 
-Table \@ref(tab:desc-race) summarizes the racial and ethnic composition of the voting-age
+Table \@ref(tab:desc-comp) summarizes the racial and ethnic composition of the voting-age
 population before the analysis. The first row is the statewide baseline, and each following row is a district.
 District shares come from the same area-weighted reaggregation of the block groups used in
-the rest of the analysis. The race categories are counted alone and add up to about 100
-percent. To read the tables, compare each district row to the Statewide row on top. A district
+the rest of the analysis. The categories come from table P4, which cross-tabs race and Hispanic
+ethnicity into mutually exclusive groups (non-Hispanic by race counted alone, plus Hispanic of any
+race), so they do not double-count and add up to about 100 percent. The Coalition column is everyone
+except non-Hispanic White alone. To read it, compare each district row to the Statewide row on top. A district
 whose share is far above the statewide share holds a lot of that group, and one far below holds
 little. Big swings between districts are the raw material the rest of the analysis examines,
 since gerrymandering works by concentrating a group in a few districts (packing) or spreading it
 thin across many (cracking).
 
-# Disabled section
-
-Disabled the following code blocks, which need to be:
-
-- consistent with disaggregating voting data into census blocks
-- responsive to a decision to be inclusive or exclusive with regards to intersectional racial/ethnic identities
-- comprehensive: just summarize all data from blocks simulaneously in one descriptive table
-
-
+```{r awr-functions, include = FALSE}
+# Reusable area-weighted reaggregation in two directional steps, defined here because
+# both the descriptive composition table below and the analysis in section 4 use them.
+# F1 disaggregate: cut source units by target polygons and area-weight the value columns
+#    into fragments. F2 aggregate: sum those fragment values up into each target unit.
+disaggregate_to_fragments <- function(source, target, value_cols) {
+  source |>
+    mutate(src_area_disagg = st_area(geom)) |>
+    st_intersection(target) |>
+    st_make_valid() |>
+    st_collection_extract("POLYGON") |>   # drop line/point slivers from planar overlaps
+    dplyr::filter(!st_is_empty(geom)) |>
+    st_cast("MULTIPOLYGON") |> st_cast("POLYGON") |>
+    mutate(frag_w_disagg = as.numeric(st_area(geom) / src_area_disagg)) |>
+    mutate(dplyr::across(dplyr::all_of(value_cols), ~ .x * frag_w_disagg),
+           frag_id = dplyr::row_number()) |>
+    dplyr::select(-src_area_disagg, -frag_w_disagg)
+}
+aggregate_to_target <- function(fragments, id_cols, value_cols) {
+  fragments |>
+    st_drop_geometry() |>
+    group_by(dplyr::across(dplyr::all_of(id_cols))) |>
+    summarize(dplyr::across(dplyr::all_of(value_cols), sum), .groups = "drop")
+}
 ```
-race_vars <- c(White = "P3_003N", Black = "P3_004N",
-               `Am. Indian / AK Native` = "P3_005N", Asian = "P3_006N",
-               `Nat. Hawaiian / Pac. Isl.` = "P3_007N", `Some other race` = "P3_008N",
-               `Two or more races` = "P3_009N")
-eth_vars <- c(`Hispanic or Latino` = "P4_002N", `Not Hispanic or Latino` = "P4_003N")
-vote_vars <- c(`Total Votes` = "totV", `Minority Party Votes` = "mpV")
-all_vars <- c(race_vars, eth_vars, vote_vars)
 
-# per-district composition by area-weighted reaggregation of the block groups
-bg_race <- blockgroups |>
-  dplyr::filter(!st_is_empty(geom)) |>
-  mutate(sarea = st_area(geom)) |>
-  dplyr::select(sarea, Total = P3_001N, dplyr::all_of(unname(all_vars)))
+```{r desc-comp, echo = FALSE, warning = FALSE, message = FALSE}
+# mutually exclusive P4 categories (voting age): non-Hispanic by race counted alone,
+# plus Hispanic of any race. They do not overlap and sum to the total.
+p4_vars <- c(`White (NH)` = "P4_005N", `Black (NH)` = "P4_006N",
+             `AIAN (NH)` = "P4_007N", `Asian (NH)` = "P4_008N",
+             `NHPI (NH)` = "P4_009N", `Other (NH)` = "P4_010N",
+             `Two+ (NH)` = "P4_011N", `Hispanic` = "P4_002N")
 
-dist_comp <- st_intersection(bg_race, districts) |>
-  st_make_valid() |> st_collection_extract("POLYGON") |>
+# per-district composition by the same area-weighted reaggregation used in the analysis
+# (disaggregate_to_fragments/aggregate_to_target), so the descriptive table and the
+# results share one intersection routine
+bg_comp <- blockgroups |>
   dplyr::filter(!st_is_empty(geom)) |>
-  mutate(w = as.numeric(st_area(geom) / sarea)) |>
-  st_drop_geometry() |>
-  group_by(DISTRICT) |>
-  summarize(dplyr::across(c(Total, dplyr::all_of(unname(all_vars))), ~ sum(.x * w)),
-            .groups = "drop") |>
+  dplyr::select(pop_vap = P4_001N, dplyr::all_of(unname(p4_vars)))
+
+dist_comp <- disaggregate_to_fragments(bg_comp, districts,
+                                       c("pop_vap", unname(p4_vars))) |>
+  aggregate_to_target("DISTRICT", c("pop_vap", unname(p4_vars))) |>
   arrange(DISTRICT)
 
 # statewide totals
 sw <- blockgroups |> st_drop_geometry() |>
-  dplyr::summarize(Total = sum(P3_001N),
-                   dplyr::across(dplyr::all_of(unname(all_vars)), ~ sum(.x)))
+  dplyr::summarize(pop_vap = sum(P4_001N),
+                   dplyr::across(dplyr::all_of(unname(p4_vars)), ~ sum(.x)))
 
-# percentages, statewide row on top
-pct <- bind_rows(sw, dplyr::select(dist_comp, -DISTRICT)) |>
-  mutate(dplyr::across(dplyr::all_of(unname(all_vars)), ~ round(.x / Total * 100, 1)))
+# percentages of the total, with a coalition column (everyone except non-Hispanic White alone)
+comp <- bind_rows(sw, dplyr::select(dist_comp, -DISTRICT))
 district_labels <- c("Statewide", as.character(dist_comp$DISTRICT))
+pct <- comp |>
+  mutate(Coalition = round((pop_vap - P4_005N) / pop_vap * 100, 1),
+         dplyr::across(dplyr::all_of(unname(p4_vars)), ~ round(.x / pop_vap * 100, 1)))
 
-race_tab <- cbind(District = district_labels, dplyr::select(pct, dplyr::all_of(unname(race_vars))))
-names(race_tab) <- c("District", names(race_vars))
-race_tab |>
-  kbl(caption = "Race composition of the voting-age population by district (%).") |>
+desc_tab <- cbind(District = district_labels,
+                  dplyr::select(pct, dplyr::all_of(unname(p4_vars)), Coalition))
+names(desc_tab) <- c("District", names(p4_vars), "Coalition")
+save_output_table(desc_tab, "Race and ethnicity of the voting-age population by district")
+
+# highlight the column for the analysis group
+group_col <- if (tolower(params$group) == "hispanic") "Hispanic" else
+             if (tolower(params$group) == "coalition") "Coalition" else
+             paste0(params$group, " (NH)")
+hl <- match(group_col, names(desc_tab))
+
+kb <- desc_tab |>
+  kbl(caption = paste0("Race and ethnicity of the voting-age population by district (%), ",
+                       params$state, ". NH is non-Hispanic alone; Coalition is all but White (NH).")) |>
   style_tbl() |>
-  row_spec(1, bold = TRUE, background = "#EAF0F1") |>
-  scroll_box(width = "100%")
+  row_spec(1, bold = TRUE, background = "#EAF0F1")
+if (!is.na(hl)) kb <- kb |> column_spec(hl, bold = TRUE, background = "#FDEBD0")
+kb |> scroll_box(width = "100%")
 ```
 
-Hispanic or Latino is an ethnicity that overlaps with race, so it is reported in a separate
-table (Table \@ref(tab:desc-hispanic)) and is not part of the sum above.
+Table \@ref(tab:desc-comp-total) repeats the district composition on the total population of all
+ages rather than the voting-age population, using table P2. A group's share can shift between the
+two bases, so both are reported. Read it the same way, comparing each district row to the Statewide
+row on top.
 
+```{r desc-comp-total, echo = FALSE, warning = FALSE, message = FALSE}
+# same categories as the voting-age table, but on the total population (all ages) from
+# table P2, disaggregated to districts by the same area-weighted routine
+p2_vars <- c(`White (NH)` = "P2_005N", `Black (NH)` = "P2_006N",
+             `AIAN (NH)` = "P2_007N", `Asian (NH)` = "P2_008N",
+             `NHPI (NH)` = "P2_009N", `Other (NH)` = "P2_010N",
+             `Two+ (NH)` = "P2_011N", `Hispanic` = "P2_002N")
+
+bg_comp_tot <- blockgroups |>
+  dplyr::filter(!st_is_empty(geom)) |>
+  dplyr::select(pop_total = P2_001N, dplyr::all_of(unname(p2_vars)))
+
+dist_comp_tot <- disaggregate_to_fragments(bg_comp_tot, districts,
+                                           c("pop_total", unname(p2_vars))) |>
+  aggregate_to_target("DISTRICT", c("pop_total", unname(p2_vars))) |>
+  arrange(DISTRICT)
+
+# statewide totals on the total population
+sw_tot <- blockgroups |> st_drop_geometry() |>
+  dplyr::summarize(pop_total = sum(P2_001N),
+                   dplyr::across(dplyr::all_of(unname(p2_vars)), ~ sum(.x)))
+
+comp_tot <- bind_rows(sw_tot, dplyr::select(dist_comp_tot, -DISTRICT))
+district_labels_tot <- c("Statewide", as.character(dist_comp_tot$DISTRICT))
+pct_tot <- comp_tot |>
+  mutate(Coalition = round((pop_total - P2_005N) / pop_total * 100, 1),
+         dplyr::across(dplyr::all_of(unname(p2_vars)), ~ round(.x / pop_total * 100, 1)))
+
+desc_tab_tot <- cbind(District = district_labels_tot,
+                      dplyr::select(pct_tot, dplyr::all_of(unname(p2_vars)), Coalition))
+names(desc_tab_tot) <- c("District", names(p2_vars), "Coalition")
+save_output_table(desc_tab_tot, "Race and ethnicity of the total population by district")
+
+# highlight the same analysis-group column as the voting-age table (group_col from above)
+hl_t <- match(group_col, names(desc_tab_tot))
+kb_t <- desc_tab_tot |>
+  kbl(caption = paste0("Race and ethnicity of the total population (all ages) by district (%), ",
+                       params$state, ". NH is non-Hispanic alone; Coalition is all but White (NH).")) |>
+  style_tbl() |>
+  row_spec(1, bold = TRUE, background = "#EAF0F1")
+if (!is.na(hl_t)) kb_t <- kb_t |> column_spec(hl_t, bold = TRUE, background = "#FDEBD0")
+kb_t |> scroll_box(width = "100%")
 ```
-hisp_tab <- cbind(District = district_labels, dplyr::select(pct, dplyr::all_of(unname(eth_vars))))
-names(hisp_tab) <- c("District", names(eth_vars))
-hisp_tab |>
-  kbl(caption = "Hispanic or Latino ethnicity of the voting-age population by district (%).") |>
+
+Table \@ref(tab:desc-statewide) shows the statewide size of each group on two population bases, the
+voting-age population used in the analysis and the total population of all ages. A group's share can
+differ between the two, so both are reported.
+
+```{r desc-statewide, echo = FALSE, warning = FALSE, message = FALSE}
+p4s <- get_decennial(geography = "state", state = params$state, sumfile = "pl",
+                     table = "P4", year = 2020, output = "wide")
+p2s <- get_decennial(geography = "state", state = params$state, sumfile = "pl",
+                     table = "P2", year = 2020, output = "wide")
+
+desc_statewide <- data.frame(
+  Group = c("White (NH)", "Black (NH)", "AIAN (NH)", "Asian (NH)", "NHPI (NH)",
+            "Other (NH)", "Two+ (NH)", "Hispanic", "Coalition (all but White NH)", "Total"),
+  vap = c(p4s$P4_005N, p4s$P4_006N, p4s$P4_007N, p4s$P4_008N, p4s$P4_009N,
+          p4s$P4_010N, p4s$P4_011N, p4s$P4_002N, p4s$P4_001N - p4s$P4_005N, p4s$P4_001N),
+  tot = c(p2s$P2_005N, p2s$P2_006N, p2s$P2_007N, p2s$P2_008N, p2s$P2_009N,
+          p2s$P2_010N, p2s$P2_011N, p2s$P2_002N, p2s$P2_001N - p2s$P2_005N, p2s$P2_001N),
+  stringsAsFactors = FALSE) |>
+  mutate(`VAP` = format(round(vap), big.mark = ","),
+         `VAP %` = round(vap / p4s$P4_001N * 100, 1),
+         `Total pop` = format(round(tot), big.mark = ","),
+         `Total pop %` = round(tot / p2s$P2_001N * 100, 1)) |>
+  dplyr::select(Group, `VAP`, `VAP %`, `Total pop`, `Total pop %`)
+
+save_output_table(desc_statewide, "Statewide composition by group on two population bases")
+
+# highlight the analysis group's row (group_col comes from the desc-comp chunk above;
+# the coalition row carries a longer label, so match it by prefix)
+grp_row_sw <- which(desc_statewide$Group == group_col |
+                    (group_col == "Coalition" & startsWith(desc_statewide$Group, "Coalition")))
+kb_sw <- desc_statewide |>
+  kbl(caption = paste0("Statewide composition by group on two population bases, ", params$state,
+                       " (VAP is voting age, Total pop is all ages).")) |>
+  style_tbl() |>
+  row_spec(nrow(desc_statewide), bold = TRUE)
+if (length(grp_row_sw)) kb_sw <- kb_sw |> row_spec(grp_row_sw, bold = TRUE, background = "#FDEBD0")
+kb_sw
+```
+
+### 3.3.4 Voting summary by district
+
+`r if (have_votes) "Table \\@ref(tab:vote-summary) summarizes the two-party vote by district, the raw counts that parallel the racial composition above. The focal party is the statewide underdog by default, or the party forced in the header." else "Precinct vote data was not loaded, so there is no voting summary for this run."`
+
+```{r vote-summary, echo = FALSE, eval = have_votes}
+# two-party votes by district, from the same area-weighting used elsewhere (block groups to
+# districts), so these totals match the ones the analysis uses. A statewide row sits on top,
+# parallel to the race table, with the other party's votes shown alongside the focal party's.
+vote_by_dist <- disaggregate_to_fragments(blockgroups_calc, districts, c("totV", "mpV")) |>
+  aggregate_to_target("DISTRICT", c("totV", "mpV")) |>
+  arrange(DISTRICT) |>
+  dplyr::transmute(District = as.character(DISTRICT), totV, mpV)
+vote_sw <- dplyr::summarize(vote_by_dist, District = "Statewide",
+                            totV = sum(totV), mpV = sum(mpV))
+vote_tab <- bind_rows(vote_sw, vote_by_dist) |>
+  dplyr::transmute(District,
+                   `Total votes` = round(totV),
+                   `Focal party votes` = round(mpV),
+                   `Other party votes` = round(totV - mpV),
+                   `Focal party %` = round(mpV / totV * 100, 1))
+save_output_table(vote_tab, "Two-party voting summary by district")
+vote_tab |>
+  kbl(caption = paste0("Two-party voting summary by district, ", params$state,
+                       ". The first row is the statewide total.")) |>
   style_tbl() |>
   row_spec(1, bold = TRUE, background = "#EAF0F1")
 ```
 
-### 3.3.4 Dot density map (where the group lives)
+### 3.3.5 Dot density map (where the group lives)
 
 A dot-density map (Figure \@ref(fig:map-dots-group)) shows where people live, which the tables above cannot show. Each dot is a
 fixed number of people, the group set by `params$group` in one color and everyone else in grey.
@@ -594,9 +897,10 @@ units to sample and render, so it is skipped automatically.
 ```{r map-dots-setup, include = FALSE}
 # dot density is only feasible at coarse units; skip it automatically for block-level data
 do_dots <- geo != "block"
+do_vote_dots <- do_dots && have_votes   # voting dot map also needs precinct data
 set.seed(1)
 dot_people <- 1000   # people per dot (voting age); raise this to speed up rendering
-bg_dots <- blockgroups |> dplyr::filter(!st_is_empty(geom))
+bg_dots <- blockgroups_calc |> dplyr::filter(!st_is_empty(geom))
 
 # helper: build one point layer per category column, sampled in proportion to its count
 sample_dots <- function(bg, cols) {
@@ -609,24 +913,56 @@ sample_dots <- function(bg, cols) {
   out$kind <- factor(out$kind, levels = names(cols))
   out
 }
+
+# public folder for the shareable, census-derived dot layer (per state). The census inputs
+# are public, so this derived layer can live outside the private folder; the vote dot layer
+# stays in the private result folder because it is built from non-redistributable RDH data.
+output_public <- here("data", "derived", "public", state_slug)
+dir.create(output_public, recursive = TRUE, showWarnings = FALSE)
 ```
 
 ```{r map-dots-group, eval = do_dots, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of ", params$group, " and everyone else, ", params$state, ".")}
-if (tolower(params$group) == "hispanic") {
-  bg_dots$grp <- bg_dots$P4_002N
-} else {
-  bg_dots$grp <- rowSums(st_drop_geometry(bg_dots)[minority_vars$name], na.rm = TRUE)
-}
-bg_dots$oth <- pmax(bg_dots$P3_001N - bg_dots$grp, 0)
+# reuse the minority and pop_basis already computed on blockgroups_calc
+bg_dots$grp <- bg_dots$minority
+bg_dots$oth <- pmax(bg_dots$pop_basis - bg_dots$minority, 0)
+
+dot_layer <- sample_dots(bg_dots, setNames(c("grp", "oth"), c(params$group, "Other")))
+group_slug <- gsub("[^A-Za-z0-9]+", "_", params$group)
+st_write(dot_layer, file.path(output_public, paste0("dot_density_", group_slug, ".gpkg")),
+         delete_dsn = TRUE, quiet = TRUE)
 
 ggplot() +
-  geom_sf(data = sample_dots(bg_dots, setNames(c("grp", "oth"), c(params$group, "Other"))),
-          aes(color = kind), size = 0.15, alpha = 0.5) +
-  geom_sf(data = districts, fill = NA, color = "grey40", linewidth = 0.3) +
-  scale_color_manual(values = setNames(c("#2166ac", "grey75"), c(params$group, "Other")),
+  geom_sf(data = dot_layer, aes(color = kind, size = kind), alpha = 0.35) +
+  geom_sf(data = districts, fill = NA, color = "grey20", linewidth = 0.45) +
+  scale_color_manual(values = setNames(c("#B34700", "grey75"), c(params$group, "Other")),
                      name = NULL) +
+  scale_size_manual(values = setNames(c(0.7, 0.3), c(params$group, "Other")), guide = "none") +
   guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
   labs(subtitle = paste0("1 dot = ", dot_people, " people (voting age)")) +
+  theme_void(base_size = 14) +
+  theme(legend.position = "bottom", plot.margin = margin(0, 0, 0, 0))
+```
+
+When precinct data is present, the same dot-density view for the focal party vote shows where each
+party's votes concentrate, alongside the group's population above.
+
+```{r map-dots-vote, eval = do_vote_dots, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Dot density of the ", fp_disp, " vote and the other party, ", params$state, ".")}
+bg_dots$mp_vote  <- bg_dots$mpV
+bg_dots$oth_vote <- pmax(bg_dots$totV - bg_dots$mpV, 0)
+
+vote_dots <- sample_dots(bg_dots, setNames(c("mp_vote", "oth_vote"),
+                                           c(fp_disp, "Other party")))
+st_write(vote_dots, file.path(output_dir, "dot_density_vote.gpkg"),
+         delete_dsn = TRUE, quiet = TRUE)
+
+ggplot() +
+  geom_sf(data = vote_dots, aes(color = kind, size = kind), alpha = 0.35) +
+  geom_sf(data = districts, fill = NA, color = "grey20", linewidth = 0.45) +
+  scale_color_manual(values = setNames(c("#CA0020", "grey75"),
+                                       c(fp_disp, "Other party")), name = NULL) +
+  scale_size_manual(values = setNames(c(0.7, 0.3), c(fp_disp, "Other party")), guide = "none") +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(subtitle = paste0("1 dot = ", dot_people, " votes")) +
   theme_void(base_size = 14) +
   theme(legend.position = "bottom", plot.margin = margin(0, 0, 0, 0))
 ```
@@ -641,39 +977,26 @@ into fragments, one per district it touches. We allocate each block group's popu
 to its fragments in proportion to area, then sum the fragments by district. We keep the
 fragments (`race_fragments`) because later steps reuse them. The intersection is made
 robust by keeping only polygons, repairing invalid geometries, dropping empty results,
-and casting to single-part polygons.
+and casting to single-part polygons. These two steps are wrapped in the reusable
+`disaggregate_to_fragments` and `aggregate_to_target` functions, defined earlier so that
+the descriptive composition table uses the same routine.
 
 ```{r district-race, warning = FALSE}
-race_fragments <- st_intersection(blockgroups_calc, districts) |>
-  st_make_valid() |>
-  st_collection_extract("POLYGON") |>   # drop line/point slivers from planar overlaps
-  dplyr::filter(!st_is_empty(geom)) |>
-  st_cast("MULTIPOLYGON") |> st_cast("POLYGON") |>
-  mutate(awTot    = Total * as.numeric(st_area(geom) / sarea),
-         awMinor  = minority * as.numeric(st_area(geom) / sarea),
-         awTotPop = TotalPop * as.numeric(st_area(geom) / sarea),
-         awtotV = totV * as.numeric(st_area(geom) / sarea),
-         awmpV = mpV * as.numeric(st_area(geom) / sarea),
-         frag_id  = row_number()) |>
-  dplyr::select(DISTRICT, frag_id, sarea, 
-                Total = awTot, 
-                minority = awMinor,
-                TotalPop = awTotPop,
-                totV = awtotV,
-                mpV = awmpV)
+# disaggregate block groups into district fragments, then aggregate back to districts.
+# race_fragments keeps the fragment geometry because the compact-population-center step reuses it.
+race_fragments <- disaggregate_to_fragments(blockgroups_calc, districts,
+                    c("pop_basis", "minority", "minority_tot", "pop_total", "totV", "mpV"))
 
 district_estimates <- race_fragments |>
-  st_drop_geometry() |>
-  group_by(DISTRICT) |>
-  summarize(bgTotal = sum(Total), 
-            bgMinority = sum(minority),
-            totV = sum(totV),
-            mpV = sum(mpV),
-            .groups = "drop")
+  aggregate_to_target("DISTRICT",
+                      c("pop_basis", "minority", "minority_tot", "pop_total", "totV", "mpV")) |>
+  rename(bgTotal = pop_basis, bgMinority = minority,
+         bgMinorityTot = minority_tot, bgTotalPop = pop_total)
 
 districts_join <- districts |>
   left_join(district_estimates, by = "DISTRICT") |>
   mutate(pctMinoritybg = round(bgMinority / bgTotal * 100, 1),
+         pctMinoritybg_tot = round(bgMinorityTot / bgTotalPop * 100, 1),
          pctMP = round(mpV / totV * 100, 1))
 ```
 
@@ -691,33 +1014,26 @@ d_ch <- districts |>
   st_convex_hull() |>
   mutate(chArea = st_area(geom))
 
-d_ch_est <- st_intersection(blockgroups_calc, d_ch) |>
-  st_make_valid() |>
-  st_collection_extract("POLYGON") |>
-  dplyr::filter(!st_is_empty(geom)) |>
-  mutate(awTot   = Total * as.numeric(st_area(geom) / sarea),
-         awMinor = minority * as.numeric(st_area(geom) / sarea)) |>
-  st_drop_geometry() |>
-  group_by(DISTRICT, chArea) |>
-  summarize(chTotal = sum(awTot), chMinority = sum(awMinor), .groups = "drop")
+d_ch_est <- disaggregate_to_fragments(blockgroups_calc, d_ch, c("pop_basis", "minority")) |>
+  aggregate_to_target(c("DISTRICT", "chArea"), c("pop_basis", "minority")) |>
+  rename(chTotal = pop_basis, chMinority = minority)
+
+# save the constructed hull shapes with their aggregated data
+d_ch |> left_join(d_ch_est, by = c("DISTRICT", "chArea")) |>
+  st_write(file.path(output_dir, "hull_shapes.gpkg"), delete_dsn = TRUE, quiet = TRUE)
 
 if (have_votes) {
-  d_ch_estV <- st_intersection(precincts, d_ch) |>
-    st_make_valid() |>
-    st_collection_extract("POLYGON") |>
-    dplyr::filter(!st_is_empty(geom)) |>
-    mutate(awTot   = totV * as.numeric(st_area(geom) / sarea),
-           awMinor = mpV  * as.numeric(st_area(geom) / sarea)) |>
-    st_drop_geometry() |>
-    group_by(DISTRICT) |>
-    summarize(chtotV = sum(awTot), chmpV = sum(awMinor), .groups = "drop")
+  d_ch_estV <- disaggregate_to_fragments(precincts, d_ch, c("totV", "mpV")) |>
+    aggregate_to_target("DISTRICT", c("totV", "mpV")) |>
+    rename(chtotV = totV, chmpV = mpV)
 }
 ```
 
-```{r map-hull, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp, fig.cap = paste0("Each district in ", params$state, " with its convex hull.")}
+```{r map-hull, echo = FALSE, fig.width = map_w, fig.height = map_w * bbox_asp(d_ch), fig.cap = paste0("Each district in ", params$state, " with its convex hull.")}
 ggplot() +
   geom_sf(data = districts, fill = "#C1E3CD", color = "#006d2c", alpha = 0.8, linewidth = 0.2) +
   geom_sf(data = d_ch, fill = "#F0FFFF", color = "#6EA6C3", alpha = 0.4, linewidth = 0.5) +
+  geom_sf_text(data = districts, aes(label = DISTRICT), size = 4, fontface = "bold", color = "grey15") +
   theme_void()
 ```
 
@@ -741,47 +1057,40 @@ d_mbc <- districts |>
   st_transform(4269) |>
   mutate(mbcArea = st_area(geom))
 
-d_mbc_est <- st_intersection(blockgroups_calc, d_mbc) |>
-  st_make_valid() |>
-  st_collection_extract("POLYGON") |>
-  dplyr::filter(!st_is_empty(geom)) |>
-  mutate(awTot   = Total * as.numeric(st_area(geom) / sarea),
-         awMinor = minority * as.numeric(st_area(geom) / sarea)) |>
-  st_drop_geometry() |>
-  group_by(DISTRICT, mbcArea) |>
-  summarize(mbcTotal = sum(awTot), mbcMinority = sum(awMinor), .groups = "drop")
+d_mbc_est <- disaggregate_to_fragments(blockgroups_calc, d_mbc, c("pop_basis", "minority")) |>
+  aggregate_to_target(c("DISTRICT", "mbcArea"), c("pop_basis", "minority")) |>
+  rename(mbcTotal = pop_basis, mbcMinority = minority)
+
+# save the constructed minimum bounding circle shapes with their aggregated data
+d_mbc |> left_join(d_mbc_est, by = c("DISTRICT", "mbcArea")) |>
+  st_write(file.path(output_dir, "mbc_shapes.gpkg"), delete_dsn = TRUE, quiet = TRUE)
 
 if (have_votes) {
-  d_mbc_estV <- st_intersection(precincts, d_mbc) |>
-    st_make_valid() |>
-    st_collection_extract("POLYGON") |>
-    dplyr::filter(!st_is_empty(geom)) |>
-    mutate(awTot   = totV * as.numeric(st_area(geom) / sarea),
-           awMinor = mpV  * as.numeric(st_area(geom) / sarea)) |>
-    st_drop_geometry() |>
-    group_by(DISTRICT) |>
-    summarize(mbctotV = sum(awTot), mbcmpV = sum(awMinor), .groups = "drop")
+  d_mbc_estV <- disaggregate_to_fragments(precincts, d_mbc, c("totV", "mpV")) |>
+    aggregate_to_target("DISTRICT", c("totV", "mpV")) |>
+    rename(mbctotV = totV, mbcmpV = mpV)
 }
 ```
 
-```{r map-mbc, echo = FALSE, fig.width = map_w, fig.height = map_w * map_asp, fig.cap = paste0("Each district in ", params$state, " with its minimum bounding circle.")}
+```{r map-mbc, echo = FALSE, fig.width = map_w, fig.height = map_w * bbox_asp(d_mbc), fig.cap = paste0("Each district in ", params$state, " with its minimum bounding circle.")}
 ggplot() +
   geom_sf(data = districts, fill = "#C1E3CD", color = "#006d2c", alpha = 0.8, linewidth = 0.2) +
   geom_sf(data = d_mbc, fill = "#F0FFFF", color = "#6EA6C3", alpha = 0.4, linewidth = 0.5) +
+  geom_sf_text(data = districts, aes(label = DISTRICT), size = 4, fontface = "bold", color = "grey15") +
   theme_void()
 ```
 
-## 4.4 Compactness scores and the Cdiff computation
+## 4.4 Compactness scores and the ΔC computation
 
 We now compare each district to its compact reference shapes. Three compactness scores
 describe how regular a district's shape is. The Polsby-Popper score uses the district
 area and perimeter, the convex hull ratio compares the district area to its hull area,
 and the Reock score compares the district area to its minimum bounding circle. The
-Cdiff scores compare composition instead of shape. `chDiff` is the district's minority
+ΔC scores compare composition instead of shape. `chDiff` is the district's minority
 percentage minus the minority percentage of its convex hull, and `mbcDiff` is the same
-for the minimum bounding circle. A positive Cdiff suggests packing and a negative Cdiff
-suggests cracking. When precinct data is present we compute the same differences for
-the minority party vote as `chDiffV` and `mbcDiffV`.
+for the minimum bounding circle. A positive ΔC means concentration and a negative ΔC
+means dilution. When precinct data is present we compute the same differences for
+the focal party vote as `chDiffV` and `mbcDiffV`.
 
 ```{r cdiff}
 districts_results <- districts_join |>
@@ -802,29 +1111,30 @@ if (have_votes) {
            mbcDiffV = pctMP - mbcPctV, mbcAbsDiffV = abs(mbcDiffV))
 }
 
-# Polsby-Popper mixes area and perimeter, so compute it in the projected CRS (meters).
-# The hull and circle scores are unit-free ratios, so geographic areas are fine there.
-dproj <- st_transform(st_geometry(districts_results), mbc_crs)
+# Polsby-Popper, hull ratio, and Reock, all from geodesic area and perimeter on EPSG 4269
+# (with s2 off, sf uses lwgeom's geodesic measures, so no projected CRS is needed).
 districts_results <- districts_results |>
-  mutate(darea = st_area(geom),
-         compact_shp  = round(as.numeric((4 * pi * st_area(dproj)) /
-                                         st_length(st_cast(dproj, "MULTILINESTRING"))^2), 2),
+  mutate(darea  = st_area(geom),
+         dperim = st_length(st_cast(geom, "MULTILINESTRING")),
+         compact_shp  = round(as.numeric((4 * pi * darea) / dperim^2), 2),
          compact_hull = round(as.numeric(darea / chArea), 2),
          compact_circ = round(as.numeric(darea / mbcArea), 2))
 ```
 
 Table \@ref(tab:compactness-table) reports the three compactness scores for each district as a
 shape reference. They describe only how regular each district's outline is, which is a separate
-question from the composition that the Cdiff scores address. A score near 1 is compact and a
+question from the composition that the ΔC scores address. A score near 1 is compact and a
 score near 0 is stringy.
 
 ```{r compactness-table, echo = FALSE}
-districts_results |> st_drop_geometry() |>
+compact_tab <- districts_results |> st_drop_geometry() |>
   dplyr::select(District = DISTRICT,
                 `Polsby-Popper` = compact_shp,
                 `Convex hull ratio` = compact_hull,
                 `Reock` = compact_circ) |>
-  arrange(District) |>
+  arrange(District)
+save_output_table(compact_tab, "Shape-compactness scores by district")
+compact_tab |>
   kbl(caption = paste0("Shape-compactness scores by district, ", params$state,
                        " (near 1 is compact, near 0 is stringy).")) |>
   style_tbl()
@@ -838,7 +1148,7 @@ from that center, adding the nearest population until it reaches the target size
 target size is the state's total population divided by the number of districts, because
 redistricting equalizes total population. Centers and distances are computed in a
 projected coordinate system so that distances are in meters. As with the other shapes,
-composition is measured with the voting-age population.
+composition is measured with the `r basis_word`.
 
 ```{r save-load-race-fragments, warning = FALSE}
 race_fragments |> st_write(
@@ -851,29 +1161,37 @@ race_fragments |> st_write(
 
 ```{r cpc-build, warning = FALSE}
 n_districts <- dplyr::n_distinct(districts$DISTRICT)
-idealpop <- sum(blockgroups_calc$TotalPop) / n_districts
+idealpop <- sum(blockgroups_calc$pop_total) / n_districts
 
-# fragment centroids in the projected CRS (meters)
-frag_pts <- race_fragments |> st_centroid() |> st_transform(mbc_crs)
-frag_xy  <- st_coordinates(frag_pts)
-frag_tab <- st_drop_geometry(frag_pts) |>
-  mutate(x = frag_xy[, 1], y = frag_xy[, 2])
+# fragment centroids: projected (meters) for the population-weighted mean center, and
+# geographic (lon/lat) for the geodesic distance used to grow the compact district
+frag_cent <- race_fragments |> st_centroid()
+frag_ll   <- st_coordinates(frag_cent)                    # lon, lat (EPSG 4269)
+frag_xy   <- st_coordinates(st_transform(frag_cent, mbc_crs))
+frag_tab  <- st_drop_geometry(frag_cent) |>
+  mutate(x = frag_xy[, 1], y = frag_xy[, 2],
+         lon = frag_ll[, 1], lat = frag_ll[, 2])
 
-# population-weighted mean center of each district
+# population-weighted mean center of each district (projected meters), then its lon/lat
 centers <- frag_tab |>
   group_by(DISTRICT) |>
-  summarize(cx = sum(x * TotalPop) / sum(TotalPop),
-            cy = sum(y * TotalPop) / sum(TotalPop), .groups = "drop") |>
+  summarize(cx = sum(x * pop_total) / sum(pop_total),
+            cy = sum(y * pop_total) / sum(pop_total), .groups = "drop") |>
   rename(cpcDistrict = DISTRICT)
+centers_ll <- st_as_sf(centers, coords = c("cx", "cy"), crs = mbc_crs) |>
+  st_transform(4269) |> st_coordinates()
+centers <- centers |> mutate(clon = centers_ll[, 1], clat = centers_ll[, 2])
 
-# for each center, take the nearest fragments until the target population is reached
+# for each center, take the nearest fragments until the target population is reached.
+# distance is the geodesic (ellipsoidal) length between the fragment and the district
+# center, so it is not distorted by the map projection
 cpc_assign <- frag_tab |>
-  dplyr::select(frag_id, DISTRICT, x, y, TotalPop, Total, minority, totV, mpV) |>
+  dplyr::select(frag_id, DISTRICT, lon, lat, pop_total, pop_basis, minority, minority_tot, totV, mpV) |>
   cross_join(centers) |>
-  mutate(dist = sqrt((x - cx)^2 + (y - cy)^2)) |>
+  mutate(dist = geosphere::distGeo(cbind(lon, lat), cbind(clon, clat))) |>
   arrange(cpcDistrict, dist) |>
   group_by(cpcDistrict) |>
-  mutate(cumpop = cumsum(TotalPop)) |>
+  mutate(cumpop = cumsum(pop_total)) |>
   dplyr::filter(cumpop <= idealpop) |>
   ungroup()
 ```
@@ -924,21 +1242,24 @@ Summarize CPC results at the district level
 # composition inside each compact population-center district (voting-age)
 cpc_est <- cpc_assign |>
   group_by(cpcDistrict) |>
-  summarize(cpcTotal = sum(Total), 
+  summarize(cpcTotal = sum(pop_basis),
             cpcMinority = sum(minority),
-            cpcIdealPop = sum(TotalPop),
+            cpcMinorityTot = sum(minority_tot),
+            cpcIdealPop = sum(pop_total),
             cpctotV = sum(totV),
-            cpcmpV = sum(mpV)) |> 
+            cpcmpV = sum(mpV)) |>
   mutate(cpcPct = round(cpcMinority / cpcTotal * 100, 1),
+         cpcPctTot = round(cpcMinorityTot / cpcIdealPop * 100, 1),
          cpcPctV = round(cpcmpV / cpctotV * 100, 1))
 
-cpc_cases <- cpc_fragments |> 
-  group_by(DISTRICT, cpcDistrict, cpc_type) |> 
-  summarize(cpcTotal = sum(Total), 
-            cpcTargetPop = sum(TotalPop),
+cpc_cases <- cpc_fragments |>
+  group_by(DISTRICT, cpcDistrict, cpc_type) |>
+  summarize(cpcTotal = sum(pop_basis),
+            cpcTargetPop = sum(pop_total),
             cpcMinority = sum(minority),
+            cpcMinorityTot = sum(minority_tot),
             cpctotV = sum(totV),
-            cpcmpV = sum(mpV)) |> 
+            cpcmpV = sum(mpV)) |>
   ungroup()
 
 cpc_cases |> st_write(file.path(output_dir, "cpc_cases.gpkg"),
@@ -947,25 +1268,29 @@ cpc_cases |> st_write(file.path(output_dir, "cpc_cases.gpkg"),
 cpcd_identity <- cpc_cases |> 
   filter(cpc_type == 'identity') |> 
   st_drop_geometry() |> 
-  mutate(cpcidTotal = cpcTotal, 
+  mutate(cpcidTotal = cpcTotal,
          cpcidMinority = cpcMinority,
+         cpcidMinorityTot = cpcMinorityTot,
          cpcidIdealPop = cpcTargetPop,
          cpcidPctMinority = round(cpcidMinority / cpcidTotal * 100, 1),
+         cpcidPctMinorityTot = round(cpcidMinorityTot / cpcidIdealPop * 100, 1),
          cpcidtotV = cpctotV,
          cpcidmpV = cpcmpV,
-         cpcidPctV = round(cpcidmpV / cpcidtotV * 100, 1)) |> 
+         cpcidPctV = round(cpcidmpV / cpcidtotV * 100, 1)) |>
   select(DISTRICT, starts_with("cpcid"))
 
 cpcd_captured <- cpc_cases |> 
   filter(cpc_type == 'captured') |> 
   st_drop_geometry() |> 
-  mutate(cpccaTotal = cpcTotal, 
+  mutate(cpccaTotal = cpcTotal,
          cpccaMinority = cpcMinority,
+         cpccaMinorityTot = cpcMinorityTot,
          cpccaIdealPop = cpcTargetPop,
          cpccaPctMinority = round(cpccaMinority / cpccaTotal * 100, 1),
+         cpccaPctMinorityTot = round(cpccaMinorityTot / cpccaIdealPop * 100, 1),
          cpccatotV = cpctotV,
          cpccampV = cpcmpV,
-         cpccaPctV = round(cpccampV / cpccatotV * 100, 1)) |> 
+         cpccaPctV = round(cpccampV / cpccatotV * 100, 1)) |>
   select(DISTRICT, starts_with("cpcca"))
 
 cpcd_excluded <- cpc_cases |> 
@@ -973,13 +1298,15 @@ cpcd_excluded <- cpc_cases |>
   st_drop_geometry() |> 
   group_by(cpcDistrict) |> 
   summarize(cpcexTotal = sum(cpcTotal),
-            cpcexMinority = sum(cpcMinority), 
+            cpcexMinority = sum(cpcMinority),
+            cpcexMinorityTot = sum(cpcMinorityTot),
             cpcexIdealPop = sum(cpcTargetPop),
             cpcextotV = sum(cpctotV),
-            cpcexmpV = sum(cpcmpV)) |> 
+            cpcexmpV = sum(cpcmpV)) |>
   mutate(DISTRICT = cpcDistrict,
          cpcexPctMinority = round(cpcexMinority / cpcexTotal * 100, 1),
-         cpcexPctV = round(cpcexmpV / cpcextotV * 100, 1)) |> 
+         cpcexPctMinorityTot = round(cpcexMinorityTot / cpcexIdealPop * 100, 1),
+         cpcexPctV = round(cpcexmpV / cpcextotV * 100, 1)) |>
   select(DISTRICT, starts_with("cpcex"))
 
 # dissolve the assigned fragments into compact population-center district shapes
@@ -1002,6 +1329,9 @@ districts_results <- districts_results |>
          cpcIdentityPct = cpcidTotal / bgTotal * 100,
          cpcCapturePctDiff = cpccaPctMinority - cpcidPctMinority,
          cpcExcludePctDiff = cpcexPctMinority - cpcidPctMinority,
+         # total-population versions, used by the CPC decomposition figure (minority basis)
+         cpcDiffTot = pctMinoritybg_tot - cpcPctTot,
+         cpcIdentityPctTot = cpcidIdealPop / bgTotalPop * 100,
          cpcDiffV = pctMP - cpcPctV,
          cpcAbsDiffV = abs(cpcDiffV),
          cpcIdentityPctV = cpcidtotV / totV * 100,
@@ -1011,164 +1341,232 @@ districts_results <- districts_results |>
 ```
 
 
-```{r scatterplot_cpcs}
-ggplot(data = districts_results, mapping = aes(x = cpcIdentityPct, y = cpcDiff)) + 
-  geom_text(aes(label = DISTRICT))
+With the compact population center built for every district, we read its results in three linked
+views, first for the group population and then, when precinct data is present, for the focal party
+vote. The three views are a scatter of ΔC against how compact each district already is, a dumbbell
+that splits each district into the population it reaches out to capture and the population it leaves
+out, and a map that locates those results in space.
+
+Figure \@ref(fig:scatterplot-cpcs) places each district by the share of its population inside the
+overlap region, the part that falls in both the actual district and its equal-population circle, on
+the horizontal axis, against its ΔC on the vertical axis. A district high on the vertical axis holds
+a larger group share than its compact center, which reads as concentration, and one low on it reads
+as dilution. The horizontal axis says how much of the district is already compact, so a point far to
+the right is mostly its own overlap region while a point to the left has been reshaped more.
+
+```{r scatterplot-cpcs, echo = FALSE, fig.width = 7, fig.height = 6, fig.cap = paste0("CPC overlap share versus ΔC by district, ", params$state, ".")}
+ggplot(districts_results, aes(x = cpcIdentityPct, y = cpcDiff)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_point(aes(fill = ifelse(cpcDiff >= 0, "Concentration", "Dilution")),
+             shape = 21, size = 9, color = "grey30", stroke = 0.6) +
+  geom_text(aes(label = DISTRICT), color = "white", fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Concentration" = "#DC6D85", "Dilution" = "#6EA6C3"), name = NULL) +
+  labs(x = "CPC overlap share of VAP (%)", y = "ΔC (percentage points)") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "top")
 ```
 
-```{r cpc-viz}
-districts_cpc_viz <- districts_results |> st_drop_geometry() |>
-  dplyr::select(DISTRICT, cpcDiff, cpcexTotal, cpcidTotal, cpccaTotal,
-                cpcexPctMinority, cpcidPctMinority, cpccaPctMinority,
-                cpcIdentityPct) |>
-  arrange(desc(cpcDiff), DISTRICT) |>
-  mutate(rank = row_number(),
-         district_label = paste0("District ", DISTRICT, " (", round(cpcDiff, 1), ")")) |>
-  pivot_longer(cols = c(cpcexTotal, cpcidTotal, cpccaTotal),
-               names_to = "segment", values_to = "width") |>
-  mutate(pct_minority = case_when(
-    segment == "cpcexTotal" ~ cpcexPctMinority,
-    segment == "cpcidTotal" ~ cpcidPctMinority,
-    segment == "cpccaTotal" ~ cpccaPctMinority
-  ),
-  segment = factor(segment,
-                   levels = c("cpcexTotal", "cpcidTotal", "cpccaTotal"))) |>
-  group_by(DISTRICT) |>
-  arrange(segment, .by_group = TRUE) |>
-  mutate(total_width = sum(width),
-         xmin = -total_width / 2 + cumsum(width) - width,
-         xmax = -total_width / 2 + cumsum(width)) |>
-  ungroup()
-
-cpc_viz_extent <- max(districts_cpc_viz$total_width, na.rm = TRUE) / 2
-
-ggplot(districts_cpc_viz,
-       aes(y = rank, xmin = xmin, xmax = xmax,
-           ymin = rank - 0.35, ymax = rank + 0.35,
-           fill = pct_minority)) +
-  geom_rect(color = "white", linewidth = 0.4) +
-  geom_text(data = dplyr::filter(districts_cpc_viz, segment == "cpcidTotal"),
-            aes(x = (xmin + xmax) / 2,
-                label = paste0(round(cpcIdentityPct, 1), "%")),
-            inherit.aes = FALSE, y = districts_cpc_viz$rank[
-              districts_cpc_viz$segment == "cpcidTotal"],
-            color = "white", fontface = "bold") +
-  scale_y_reverse(breaks = unique(districts_cpc_viz$rank),
-                  labels = districts_cpc_viz$district_label[match(
-                    unique(districts_cpc_viz$rank), districts_cpc_viz$rank)]) +
-  scale_x_continuous(breaks = c(-cpc_viz_extent, 0, cpc_viz_extent),
-                     labels = c("excluded", "identity", "captured")) +
-  scale_fill_distiller(palette = "YlGnBu", direction = 1,
-                       limits = c(0, 100), name = "Minority share (%)") +
-  labs(x = NULL,
-       y = "District (CPC difference)") +
-  theme_bw(base_size = 15) +
-  theme(panel.grid.major.y = element_blank(),
-        panel.grid.minor = element_blank(),
-        legend.position = "bottom")
-```
-- Y-axis brackets: Delta C
-- Y-axis order: Delta C
-- X-axis: length proportional to population or votes
-- excluded: not inside district, but inside the equal-population circle, i.e. district boundaries were contorted to "exclude" this population from the district, perhaps unfairly
-- identity: inside the district AND inside the equal-population circle, i.e. composition of the part of the district that is most compact in shape. Even if composition is unusually high or low, this is a compact shape and likely fair. 
-- captured: inside the district, but NOT inside the equal-population circle, i.e. district boundaries were contorted to "capture" this population into the district, perhaps unfairly
-- Length of bar segments: total voting-age population
-- Color of bar segments: proportion of the segment that is a minority
-
-```{r scatterplot_cpc_votes}
-ggplot(data = districts_results, mapping = aes(x = cpcIdentityPctV, y = cpcDiffV)) + 
-  geom_text(aes(label = DISTRICT))
+```{r cpc-dumbbell-setup, include = FALSE}
+# Reusable dumbbell for the CPC decomposition, used by the race and the vote figures.
+# Each district is one row. The overlap region (inside both the district and its equal-population
+# circle) is fixed at 0 on a common vertical line, and the two markers are each region's share
+# relative to that overlap: a circle for the captured region (population the
+# district reaches out to pull in) and a diamond for the excluded region (population the compact
+# circle would have held but the district leaves out). The whole row (line, both markers, and
+# the district label) is colored by direction: red for concentration (positive ΔC) and blue for
+# dilution (negative ΔC). Marker area is the region's size (population or votes), and within a
+# row the circle and diamond positions show how the ΔC came about. Districts are ordered by ΔC,
+# and each region's actual share is printed in black just outside its marker.
+make_cpc_dumbbell <- function(overlap_col, captured_col, excluded_col,
+                              cap_size_col, exc_size_col, diff_col, value_label) {
+  df <- districts_results |> st_drop_geometry() |>
+    dplyr::transmute(DISTRICT,
+                     overlap  = .data[[overlap_col]],
+                     captured = .data[[captured_col]],
+                     excluded = .data[[excluded_col]],
+                     cap_size = .data[[cap_size_col]],
+                     exc_size = .data[[exc_size_col]],
+                     dC       = .data[[diff_col]]) |>
+    arrange(dC) |>
+    mutate(rank = row_number(),
+           direction = ifelse(dC >= 0, "Concentration", "Dilution"),
+           dir_col = ifelse(dC >= 0, "#C0405E", "#3E7EA0"),
+           row_label = paste0("<span style='color:", dir_col, "'>District ", DISTRICT,
+                              " (", sprintf("%+.1f", dC), ")</span>"),
+           cap_dev = captured - overlap,   # each region's share relative to the overlap region
+           exc_dev = excluded - overlap,
+           cap_right = cap_dev >= exc_dev,
+           cap_x = cap_dev + ifelse(cap_right,  4, -4),   # print the actual share just outside
+           cap_h = ifelse(cap_right, 0, 1),               # the marker, on the outboard side
+           exc_x = exc_dev + ifelse(cap_right, -4,  4),
+           exc_h = ifelse(cap_right, 1, 0))
+  ggplot(df, aes(y = rank)) +
+    geom_vline(xintercept = 0, color = "grey45", linewidth = 0.5) +
+    geom_segment(aes(x = exc_dev, xend = cap_dev, y = rank, yend = rank, color = direction),
+                 linewidth = 1) +
+    geom_point(aes(x = exc_dev, size = exc_size, color = direction,
+                   shape = "Excluded (left out)")) +
+    geom_point(aes(x = cap_dev, size = cap_size, color = direction,
+                   shape = "Captured (pulled in)")) +
+    geom_text(aes(x = cap_x, label = round(captured), hjust = cap_h),
+              size = 3.8, color = "black") +
+    geom_text(aes(x = exc_x, label = round(excluded), hjust = exc_h),
+              size = 3.8, color = "black") +
+    scale_color_manual(values = c("Concentration" = "#C0405E", "Dilution" = "#3E7EA0"),
+                       name = NULL) +
+    scale_shape_manual(values = c("Captured (pulled in)" = 16, "Excluded (left out)" = 18),
+                       breaks = c("Captured (pulled in)", "Excluded (left out)"), name = NULL) +
+    scale_size_area(max_size = 12, guide = "none") +
+    scale_y_reverse(breaks = df$rank, labels = df$row_label) +
+    labs(x = paste0(value_label, " minus the overlap share (percentage points, 0 = overlap)"),
+         y = "District (ΔC), ordered by ΔC") +
+    theme_bw(base_size = 15) +
+    theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.y = ggtext::element_markdown(),
+          legend.position = "bottom", legend.box = "vertical", legend.spacing.y = unit(2, "pt")) +
+    guides(color = guide_legend(order = 1, override.aes = list(shape = NA, linewidth = 1.4)),
+           shape = guide_legend(order = 2, override.aes = list(size = 4, color = "grey30")))
+}
 ```
 
-```{r cpc-viz-votes}
-districts_cpc_viz <- districts_results |> st_drop_geometry() |>
-  dplyr::select(DISTRICT, cpcDiffV, cpcextotV, cpcidtotV, cpccatotV,
-                cpcexPctV, cpcidPctV, cpccaPctV,
-                cpcIdentityPctV) |>
-  arrange(desc(cpcDiffV), DISTRICT) |>
-  mutate(rank = row_number(),
-         district_label = paste0("District ", DISTRICT, " (", round(cpcDiffV, 1), ")")) |>
-  pivot_longer(cols = c(cpcextotV, cpcidtotV, cpccatotV),
-               names_to = "segment", values_to = "width") |>
-  mutate(pct_minority = case_when(
-    segment == "cpcextotV" ~ cpcexPctV,
-    segment == "cpcidtotV" ~ cpcidPctV,
-    segment == "cpccatotV" ~ cpccaPctV
-  ),
-  segment = factor(segment,
-                   levels = c("cpcextotV", "cpcidtotV", "cpccatotV"))) |>
-  group_by(DISTRICT) |>
-  arrange(segment, .by_group = TRUE) |>
-  mutate(total_width = sum(width),
-         xmin = -total_width / 2 + cumsum(width) - width,
-         xmax = -total_width / 2 + cumsum(width)) |>
-  ungroup()
+Figure \@ref(fig:cpc-viz) is that dumbbell for the group population, measured on the total population of
+all ages. Each district is one row, and the grey vertical line at 0 is the overlap region, the part
+inside both the actual district and its equal-population circle, the same reference for every
+district so the rows line up. The horizontal axis is each region's share minus the overlap share, so 0
+means the same as the overlap, a marker to the right is more group-heavy than the overlap, and one to
+the left is less. The captured region is a circle and the excluded region is a diamond. The whole row, the line, both markers, and the district
+label, is red when the district concentrates the group, a positive ΔC, and blue when it dilutes it, a
+negative ΔC. Within a row the circle and diamond positions show how that came about, whether by reaching
+out to capture group-heavy population or by carving out group-heavy population. Marker area is the
+region's total population, and each region's actual share is printed in black just outside its marker.
 
-cpc_viz_extent <- max(districts_cpc_viz$total_width, na.rm = TRUE) / 2
+```{r cpc-viz, echo = FALSE, warning = FALSE, fig.height = max(5, 0.9 * n_districts), fig.width = 10, fig.cap = paste0("CPC decomposition of each district into overlap, captured, and excluded regions by the group's share of total population, ", params$state, ". Read together with the ΔC map that follows.")}
+make_cpc_dumbbell("cpcidPctMinorityTot", "cpccaPctMinorityTot", "cpcexPctMinorityTot",
+                  "cpccaIdealPop", "cpcexIdealPop", "cpcDiffTot",
+                  "Minority share")
+```
 
-ggplot(districts_cpc_viz,
-       aes(y = rank, xmin = xmin, xmax = xmax,
-           ymin = rank - 0.35, ymax = rank + 0.35,
-           fill = pct_minority)) +
-  geom_rect(color = "white", linewidth = 0.4) +
-  geom_text(data = dplyr::filter(districts_cpc_viz, segment == "cpcidtotV"),
-            aes(x = (xmin + xmax) / 2,
-                label = paste0(round(cpcIdentityPctV, 1), "%")),
-            inherit.aes = FALSE, y = districts_cpc_viz$rank[
-              districts_cpc_viz$segment == "cpcidtotV"],
-            color = "white", fontface = "bold") +
-  scale_y_reverse(breaks = unique(districts_cpc_viz$rank),
-                  labels = districts_cpc_viz$district_label[match(
-                    unique(districts_cpc_viz$rank), districts_cpc_viz$rank)]) +
-  scale_x_continuous(breaks = c(-cpc_viz_extent, 0, cpc_viz_extent),
-                     labels = c("excluded", "identity", "captured")) +
-  scale_fill_distiller(palette = "YlGnBu", direction = 1,
-                       limits = c(0, 100), name = "Minority share (%)") +
-  labs(x = NULL,
-       y = "District (CPC difference)") +
-  theme_bw(base_size = 15) +
-  theme(panel.grid.major.y = element_blank(),
-        panel.grid.minor = element_blank(),
-        legend.position = "bottom")
+Figure \@ref(fig:cpc-viz-map) is the locator for those bars. It shades each district on the state map
+by its total-population ΔC, red for concentration and blue for dilution, so the abstract bars above
+have a geographic place and you can see where the concentrated and diluted districts sit.
+
+```{r cpc-viz-map, echo = FALSE, warning = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 1.0, fig.cap = paste0("Compact population-center ΔC by district, ", params$state, ". The locator for the CPC decomposition above.")}
+cpc_map_df <- districts |> dplyr::select(DISTRICT) |>
+  left_join(dplyr::select(st_drop_geometry(districts_results), DISTRICT, cpcDiffTot),
+            by = "DISTRICT")
+cpc_map_lim <- max(abs(cpc_map_df$cpcDiffTot), na.rm = TRUE)
+ggplot(cpc_map_df) +
+  geom_sf(aes(fill = cpcDiffTot), color = "grey40", linewidth = 0.2) +
+  geom_sf_text(aes(label = DISTRICT), size = 4.5, fontface = "bold", color = "grey15") +
+  scale_fill_gradient2(low = "#6EA6C3", mid = "white", high = "#DC6D85", midpoint = 0,
+                       limits = c(-cpc_map_lim, cpc_map_lim),
+                       breaks = c(-cpc_map_lim, 0, cpc_map_lim),
+                       labels = c("Dilution", "0", "Concentration"), name = "ΔC") +
+  theme_void(base_size = 14) +
+  theme(legend.position = "bottom", legend.key.width = unit(1.4, "cm"))
+```
+When precinct data is present, the next three figures repeat the same three views for the focal party
+vote, where segment color and ΔC now measure the focal party's share of the two-party vote instead of
+the group population, so the same district can read differently on race and on votes.
+
+Figure \@ref(fig:scatterplot-cpc-votes) is the partisan scatter. Each district sits by the share of
+its vote inside the overlap region on the horizontal axis against its partisan ΔC on the vertical
+axis, so a district high on the axis concentrates the focal party's vote relative to its compact
+center and one low on it dilutes it.
+
+```{r scatterplot-cpc-votes, echo = FALSE, eval = have_votes, fig.width = 7, fig.height = 6, fig.cap = paste0("CPC overlap share versus partisan ΔC by district, ", params$state, ".")}
+ggplot(districts_results, aes(x = cpcIdentityPctV, y = cpcDiffV)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_point(aes(fill = ifelse(cpcDiffV >= 0, "Concentration", "Dilution")),
+             shape = 21, size = 9, color = "grey30", stroke = 0.6) +
+  geom_text(aes(label = DISTRICT), color = "white", fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Concentration" = "#DC6D85", "Dilution" = "#6EA6C3"), name = NULL) +
+  labs(x = "CPC overlap share of votes (%)", y = "ΔC (percentage points)") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+Figure \@ref(fig:cpc-viz-votes) is the same dumbbell for the focal party vote, read the same way. The
+line at 0 is the overlap region, the circle is the captured region and the diamond the excluded region,
+each at the focal party's share relative to the overlap, and the row is red where the district
+concentrates the focal party's vote and blue where it dilutes it. Marker area is the region's two-party
+vote, so a large marker carries many votes.
+
+```{r cpc-viz-votes, echo = FALSE, eval = have_votes, warning = FALSE, fig.height = max(5, 0.9 * n_districts), fig.width = 10, fig.cap = paste0("CPC decomposition for the ", fp_disp, " vote into overlap, captured, and excluded regions, ", params$state, ". Read together with the ΔC map that follows.")}
+make_cpc_dumbbell("cpcidPctV", "cpccaPctV", "cpcexPctV",
+                  "cpccatotV", "cpcextotV", "cpcDiffV",
+                  paste0(fp_disp, " share"))
+```
+
+Figure \@ref(fig:cpc-viz-votes-map) is the locator for the partisan bars. It shades each district on
+the state map by its partisan ΔC, red for concentration and blue for dilution, so you can see where
+the focal party's vote is concentrated or diluted across the state.
+
+```{r cpc-viz-votes-map, echo = FALSE, eval = have_votes, warning = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 1.0, fig.cap = paste0("Partisan ΔC by district for the ", fp_disp, " vote, ", params$state, ". The locator for the CPC decomposition above.")}
+cpc_map_df <- districts |> dplyr::select(DISTRICT) |>
+  left_join(dplyr::select(st_drop_geometry(districts_results), DISTRICT, cpcDiffV),
+            by = "DISTRICT")
+cpc_map_lim <- max(abs(cpc_map_df$cpcDiffV), na.rm = TRUE)
+ggplot(cpc_map_df) +
+  geom_sf(aes(fill = cpcDiffV), color = "grey40", linewidth = 0.2) +
+  geom_sf_text(aes(label = DISTRICT), size = 4.5, fontface = "bold", color = "grey15") +
+  scale_fill_gradient2(low = "#6EA6C3", mid = "white", high = "#DC6D85", midpoint = 0,
+                       limits = c(-cpc_map_lim, cpc_map_lim),
+                       breaks = c(-cpc_map_lim, 0, cpc_map_lim),
+                       labels = c("Dilution", "0", "Concentration"), name = "ΔC") +
+  theme_void(base_size = 14) +
+  theme(legend.position = "bottom", legend.key.width = unit(1.4, "cm"))
 ```
 
 
 ```{r save-districts}
+# the geometry layer here, the flat CSV once in the save-results chunk below
 districts_results |> st_write(file.path(output_dir, "district_results.gpkg"),
                               append = FALSE)
-
-districts_results |> 
-  st_drop_geometry() |> 
-  write_csv(file.path(output_dir, "district_results.csv"))
 ```
 
 
+Figure \@ref(fig:map-cpc) draws the compact population-center districts over the actual districts, so
+the reference shape behind the ΔC is visible on the map. The white dot marks each district's
+population-weighted center and the cross marks its geometric centroid, and the gap between the two
+shows how far the population is pulled to one side of the district.
+
 ```{r map-cpc, echo = FALSE, warning = FALSE, fig.width = map_w, fig.height = map_w * map_asp + 0.6, fig.cap = paste0("Compact population-center districts over the actual districts, ", params$state, ".")}
+# population-weighted center (from centers, in mbc_crs) and geometric centroid, both to 4269
+weighted_ctr <- st_as_sf(centers, coords = c("cx", "cy"), crs = mbc_crs) |>
+  st_transform(4269)
+geom_ctr <- st_centroid(st_geometry(districts))
+st_write(weighted_ctr, file.path(output_dir, "weighted_centers.gpkg"),
+         delete_dsn = TRUE, quiet = TRUE)
+
 ggplot() +
   geom_sf(data = districts, fill = NA, color = "grey60", linewidth = 0.3) +
   geom_sf(data = cpc_districts, aes(fill = factor(cpcDistrict)), color = NA, alpha = 0.5) +
-  labs(fill = "District") +
+  geom_sf(data = geom_ctr, shape = 3, color = "grey15", size = 2, stroke = 0.7) +
+  geom_sf(data = weighted_ctr, shape = 21, fill = "white", color = "grey15", size = 2.4, stroke = 0.7) +
+  labs(fill = "District",
+       subtitle = "White dot is the population-weighted center, cross is the geometric centroid.") +
   theme_void() +
   theme(legend.position = "bottom", plot.margin = margin(0, 0, 0, 0))
 ```
 
+
 # 5 Results
 
-## 5.1 Composition difference (Cdiff) table
+## 5.1 Composition difference (ΔC) table
 
-We report the composition difference two ways, first for the minority party vote and then for the
+We report the composition difference two ways, first for the focal party vote and then for the
 group population, matching the order of the figures. `r if (have_votes) "Tables \\@ref(tab:results-table-party) and \\@ref(tab:results-table) hold" else "Table \\@ref(tab:results-table) holds"` the
 numeric core of the analysis, and every figure below draws from these numbers. Each row is a
 district. `pctMinoritybg` is the group's share of the actual district, and `chPct`, `mbcPct`, and
 `cpcPct` are the group's share inside the convex hull, the minimum bounding circle, and the compact
 population center. `chDiff`, `mbcDiff`, and `cpcDiff` are the actual share minus each of those, so a
-positive value is packing and a negative value is cracking. To read it, scan the three Cdiff columns
+positive value is concentration and a negative value is dilution. To read it, scan the three ΔC columns
 for each district. A district with large positive values across all three is strongly packed, and
 one with large negative values across all three is strongly cracked. Values near zero mean the shape
 does not move the composition much. When the three columns disagree in sign, the result depends on
 the reference shape, which is itself worth noting. When precinct data is loaded, the partisan table
-repeats the same calculation for the minority party vote, with `pctMP` the party's share of the
+repeats the same calculation for the focal party vote, with `pctMP` the party's share of the
 actual district and `chDiffV`, `mbcDiffV`, and `cpcDiffV` the differences from each reference shape.
 Shape compactness is a separate question, reported in Table \@ref(tab:compactness-table). The full
 result, including every column, is written to a CSV file.
@@ -1179,17 +1577,19 @@ show_cols_v <- c("DISTRICT", "pctMP", "chPctV", "chDiffV", "mbcPctV", "mbcDiffV"
 tabv <- districts_results |> st_drop_geometry() |>
   dplyr::select(any_of(show_cols_v)) |>
   arrange(DISTRICT)
+save_output_table(tabv, paste0("Delta-C by district for the ", fp_disp, " vote"))
 tabv |>
-  kbl(caption = paste0("Cdiff by district for the minority party vote, ",
-                         params$state, ".")) |>
+  kbl(caption = paste0("ΔC by district for the ", fp_disp, " vote, ",
+                         params$state, "."),
+      col.names = c("District", "Actual %", "Share %", "ΔC", "Share %", "ΔC", "Share %", "ΔC")) |>
   style_tbl() |>
   column_spec(4, bold = TRUE, color = diff_color(tabv$chDiffV)) |>
   column_spec(6, bold = TRUE, color = diff_color(tabv$mbcDiffV)) |>
   column_spec(8, bold = TRUE, color = diff_color(tabv$cpcDiffV)) |>
   add_header_above(ref_header, escape = FALSE) |>
-  footnote(general = paste0("Cdiff is the actual district's share minus the reference share. ",
-             "Positive suggests <span style='color:#C0405E'>packing</span> and negative ",
-             "suggests <span style='color:#3E7EA0'>cracking</span>."),
+  footnote(general = paste0("ΔC is the actual district's share minus the reference share. ",
+             "Positive is <span style='color:#C0405E'>concentration</span> and negative ",
+             "is <span style='color:#3E7EA0'>dilution</span>."),
            general_title = "Note. ", escape = FALSE) |>
   scroll_box(width = "100%")
 ```
@@ -1200,17 +1600,19 @@ show_cols <- c("DISTRICT", "pctMinoritybg", "chPct", "chDiff", "mbcPct", "mbcDif
 tab <- districts_results |> st_drop_geometry() |>
   dplyr::select(any_of(show_cols)) |>
   arrange(DISTRICT)
+save_output_table(tab, paste0("Delta-C by district for the ", params$group, " ", basis_word))
 tab |>
-  kbl(caption = paste0("Cdiff by district for the ", params$group, " population, ",
-                         params$state, ".")) |>
+  kbl(caption = paste0("ΔC by district for the ", params$group, " ", basis_word, ", ",
+                         params$state, "."),
+      col.names = c("District", "Actual %", "Share %", "ΔC", "Share %", "ΔC", "Share %", "ΔC")) |>
   style_tbl() |>
   column_spec(4, bold = TRUE, color = diff_color(tab$chDiff)) |>
   column_spec(6, bold = TRUE, color = diff_color(tab$mbcDiff)) |>
   column_spec(8, bold = TRUE, color = diff_color(tab$cpcDiff)) |>
   add_header_above(ref_header, escape = FALSE) |>
-  footnote(general = paste0("Cdiff is the actual district's share minus the reference share. ",
-             "Positive suggests <span style='color:#C0405E'>packing</span> and negative ",
-             "suggests <span style='color:#3E7EA0'>cracking</span>."),
+  footnote(general = paste0("ΔC is the actual district's share minus the reference share. ",
+             "Positive is <span style='color:#C0405E'>concentration</span> and negative ",
+             "is <span style='color:#3E7EA0'>dilution</span>."),
            general_title = "Note. ", escape = FALSE) |>
   scroll_box(width = "100%")
 ```
@@ -1220,7 +1622,7 @@ districts_results |> st_drop_geometry() |>
   write_csv(file.path(output_dir, "district_results.csv"))
 ```
 
-## 5.2 Interpreting the composition difference (Cdiff)
+## 5.2 Interpreting the composition difference (ΔC)
 
 Our approach asks a single question, whether a district's shape changes who it
 represents. Rather than judging a district by how irregular it looks, it compares the
@@ -1229,53 +1631,58 @@ that same district. The reference can be the convex hull, the minimum bounding c
 or the compact population center. The metric is the difference between the two
 compositions.
 
-$$C_{diff} = C_{district} - C_{reference}$$
+$$\Delta C = C_{district} - C_{reference}$$
 
 Here $C_{district}$ is the minority percentage inside the actual district and
-$C_{reference}$ is the minority percentage inside the compact reference shape. `chDiff`,
-`mbcDiff`, and `cpcDiff` apply this formula to the convex hull, the minimum bounding
-circle, and the compact population center. When precinct data is present, `chDiffV`,
-`mbcDiffV`, and `cpcDiffV` apply the same idea to the minority party vote.
+$C_{reference}$ is the minority percentage inside the compact reference shape. A subscript
+names the reference shape, so $\Delta C_{hull}$, $\Delta C_{mbc}$, and $\Delta C_{cpc}$ apply
+this formula to the convex hull, the minimum bounding circle, and the compact population
+center (in code `chDiff`, `mbcDiff`, and `cpcDiff`). When precinct data is present a
+superscript $v$ marks the version computed on the focal party vote, so $\Delta C_{hull}^{v}$,
+$\Delta C_{mbc}^{v}$, and $\Delta C_{cpc}^{v}$ (in code `chDiffV`, `mbcDiffV`, and `cpcDiffV`).
+The sign carries the direction, a positive $\Delta C$ toward concentration and a negative one
+toward dilution. We use concentration and dilution as neutral terms for the direction, and reserve
+packing and cracking for districts with clear evidence of gerrymandering.
 
-There are three cases to read. When $C_{diff}$ is strongly positive, the actual district
-holds a higher share of the group than its compact reference, which may suggest packing,
-especially where the district is already majority-minority and the group is
-over-represented relative to the compact shape. When $C_{diff}$ is strongly negative, the
-actual district holds a lower share than its compact reference, which suggests cracking,
-dilution, or the exclusion of nearby group members. When $C_{diff}$ is close to zero, the
+There are three cases to read. When $\Delta C$ is strongly positive, the actual district
+holds a higher share of the group than its compact reference, which we call concentration.
+This may indicate packing where the district is already majority-minority and the group is
+over-represented relative to the compact shape. When $\Delta C$ is strongly negative, the
+actual district holds a lower share than its compact reference, which we call dilution, and
+which may indicate cracking or the exclusion of nearby group members. When $\Delta C$ is close to zero, the
 irregular shape does not meaningfully change the group's composition, so the district may
 look non-compact while its shape does not appear to distort racial or partisan
 representation.
 
 In the figures that follow, the reading is based on the distance between the actual
 district (the black point) and the compact-shape estimates. The black point to the right
-of the others points toward packing, and to the left points toward cracking. As you read
+of the others points toward concentration, and to the left points toward dilution. As you read
 the table and figures, consider which districts show the largest gap between the actual
-composition and the compact-shape composition, which appear potentially packed, which
-appear potentially cracked or diluted, and which stay similar across all geometries.
+composition and the compact-shape composition, which appear potentially concentrated, which
+appear potentially diluted, and which stay similar across all geometries.
 
 ## 5.3 Composition by district and reference shape
 
 Figure \@ref(fig:figure-composition) has one panel per district. Within a panel, the row labeled Minority Population (%) is the
-racial or ethnic composition, and the row labeled Minority Party Vote (%) is the partisan
-composition. Minority Population is the share of the voting-age population that belongs to the
-group set by `params$group`. Minority Party Vote is the share of the two-party presidential
-vote won by the statewide minority party. The vote row appears only when precinct data is
+racial or ethnic composition, and the row labeled Focal Party Vote (%) is the partisan
+composition. Minority Population is the share of the `r basis_word` that belongs to the
+group set by `params$group`. Focal Party Vote is the share of the two-party vote for the
+chosen office won by the focal party. The vote row appears only when precinct data is
 loaded.
 
 Each row carries four points, one for the actual district and one for each compact reference
 shape. Black dots are the composition of the actual district. Green dots are the composition
 inside its convex hull. Purple dots are the composition inside its minimum bounding circle. Orange
 dots are the composition inside its compact population center. The distance from the black dot to
-each colored dot is that reference's Cdiff.
+each colored dot is that reference's ΔC.
 
 To read it, go left to right along each row. When the black point sits to the right of the
 colored points, the actual district holds more of the group than its compact references, which
-points to packing. When it sits to the left, the district holds less, which points to cracking.
+points to concentration. When it sits to the left, the district holds less, which points to dilution.
 When it sits on top of the colored points, the shape barely changes the composition. When
 the colored points fall on both sides of the black point, the three methods disagree, so read that
-district with care. The dashed line at 50 percent marks a majority. We do not print the Cdiff
-numbers on the plot to keep it readable, so read the exact values from the Cdiff table above.
+district with care. The dashed lines mark margin bands around a majority, a tight one at 47.5 and 52.5 percent and a wider one at 45 and 55 percent, so a district inside them is close to even and only outside is the majority clear. We do not print the ΔC
+numbers on the plot to keep it readable, so read the exact values from the ΔC table above.
 
 ```{r figure-composition, echo = FALSE, warning = FALSE, fig.height = max(6, 1.5 * n_districts), fig.width = 10, fig.cap = paste0("Composition by district and reference shape, ", params$state, ".")}
 combined <- districts_results |> st_drop_geometry() |>
@@ -1285,38 +1692,46 @@ if (have_votes)
   combined <- bind_rows(combined,
     districts_results |> st_drop_geometry() |>
       dplyr::select(DISTRICT, actual = pctMP, hull = chPctV, mbc = mbcPctV, cpc = cpcPctV) |>
-      mutate(type = "Minority Party Vote (%)"))
+      mutate(type = "Focal Party Vote (%)"))
 combined <- combined |>
   mutate(DISTRICT = factor(DISTRICT, levels = sort(unique(districts_results$DISTRICT))),
-         type = factor(type, levels = c("Minority Population (%)", "Minority Party Vote (%)")))
+         type = factor(type, levels = c("Minority Population (%)", "Focal Party Vote (%)")))
 
-ggplot(combined, aes(y = type)) + xlim(0, 100) +
-  geom_vline(xintercept = 50, color = "grey35", linewidth = 0.7, linetype = "dashed") +
-  geom_point(aes(x = hull),   color = "#3E9B63", size = 5) +
-  geom_point(aes(x = mbc),    color = "#7D3C98", size = 5) +
-  geom_point(aes(x = cpc),    color = "#D98400", size = 5) +
-  geom_point(aes(x = actual), color = "#222222", size = 5) +
+# long form so the reference type becomes a legend (color + shape), open shapes stay
+# readable where points overlap
+combined_long <- combined |>
+  pivot_longer(c(actual, hull, mbc, cpc), names_to = "reference", values_to = "pct") |>
+  mutate(reference = factor(reference, levels = c("actual", "hull", "mbc", "cpc"),
+                            labels = c("Actual district", "Convex hull",
+                                       "Min. bounding circle", "Compact pop. center")))
+
+ggplot(combined_long, aes(x = pct, y = type, color = reference, shape = reference)) + xlim(0, 100) +
+  geom_vline(xintercept = c(45, 55), color = "grey70", linewidth = 0.6, linetype = "dashed") +
+  geom_vline(xintercept = c(47.5, 52.5), color = "grey35", linewidth = 0.7, linetype = "dashed") +
+  geom_point(size = 3.8, stroke = 1.3) +
+  scale_color_manual(values = c("Actual district" = "#222222", "Convex hull" = "#3E9B63",
+                                "Min. bounding circle" = "#7D3C98", "Compact pop. center" = "#D98400"),
+                     name = NULL) +
+  scale_shape_manual(values = c("Actual district" = 1, "Convex hull" = 2,
+                                "Min. bounding circle" = 0, "Compact pop. center" = 5),
+                     name = NULL) +
   facet_wrap(~ DISTRICT, ncol = 1, labeller = label_both) +
-  labs(subtitle = paste0(
-         "<span style='color:#222222'>Black dots</span>: the actual district. ",
-         "<span style='color:#3E9B63'>Green dots</span>: convex-hull reference.<br>",
-         "<span style='color:#7D3C98'>Purple dots</span>: minimum-bounding-circle reference. ",
-         "<span style='color:#D98400'>Orange dots</span>: compact-population-center reference."),
-       x = "Percentage (%)", y = NULL) +
+  labs(x = "Percentage (%)", y = NULL,
+       caption = "Dashed grey lines mark margin bands around a 50% majority, tight at 47.5 to 52.5 and wide at 45 to 55.") +
   theme_bw(base_size = 15) +
-  theme(plot.subtitle = ggtext::element_markdown())
+  theme(legend.position = "top", plot.caption = element_text(hjust = 0, color = "grey35"))
 ```
 
-## 5.4 Composition difference (Cdiff) by district
+## 5.4 Composition difference (ΔC) by district
 
-We show the Cdiff two ways, first as bars for the exact size and ranking, then as maps for the
+We show the ΔC two ways, first as bars for the exact size and ranking, then as maps for the
 spatial pattern.
 
-### 5.4.1 Cdiff bar chart by district and reference shape
+### 5.4.1 ΔC bar chart by district and reference shape
 
-Each bar in `r if (have_votes) "Figures \\@ref(fig:figure-cdiff-bars-party) and \\@ref(fig:figure-cdiff-bars-race)" else "Figure \\@ref(fig:figure-cdiff-bars-race)"` is one district's Cdiff. Bars to the right are packing and bars to the left are
-cracking. The three panels are the three reference shapes, in the same order and colors as the
-composition figure above. Districts are sorted by convex hull Cdiff, so the most packed sit at
+Each bar in `r if (have_votes) "Figures \\@ref(fig:figure-cdiff-bars-party) and \\@ref(fig:figure-cdiff-bars-race)" else "Figure \\@ref(fig:figure-cdiff-bars-race)"` is one district's ΔC. Bars to the right are concentration and bars to the left are
+dilution. The three panels are the three reference shapes, in the same order and colors as the
+composition figure above. Districts are sorted by convex hull ΔC, so the most packed sit at
 the top and the most cracked at the bottom. `r if (have_votes) "The partisan version comes first and the racial version below it." else "Only the racial version is shown, because no precinct data is loaded."` A packed
 district shows a right-pointing bar in every panel, and a cracked district shows a left-pointing
 bar in every panel. When a district's bar points right in one panel but left in another, the
@@ -1333,36 +1748,36 @@ make_cdiff_bars <- function(dcols, ttl) {
     pivot_longer(-DISTRICT, names_to = "reference", values_to = "Cdiff") |>
     mutate(DISTRICT = factor(DISTRICT, levels = ord),
            reference = factor(reference, levels = c("Convex Hull", "Min. Bounding Circle", "Compact Pop. Center")),
-           direction = ifelse(Cdiff >= 0, "Packing", "Cracking")) |>
+           direction = ifelse(Cdiff >= 0, "Concentration", "Dilution")) |>
     ggplot(aes(x = Cdiff, y = DISTRICT, fill = direction)) +
     geom_col() +
     geom_vline(xintercept = 0, color = "grey35", linewidth = 0.6) +
-    scale_fill_manual(values = c("Packing" = "#DC6D85", "Cracking" = "#6EA6C3")) +
+    scale_fill_manual(values = c("Concentration" = "#DC6D85", "Dilution" = "#6EA6C3")) +
     facet_wrap(~ reference, labeller = as_labeller(ref_labels)) +
-    labs(x = "Cdiff (percentage points)", y = "District", fill = NULL) +
+    labs(x = "ΔC (percentage points)", y = "District", fill = NULL) +
     theme_bw(base_size = 15) +
     theme(legend.position = "bottom",
           strip.text = ggtext::element_markdown(size = 15, face = "bold"))
 }
 ```
 
-```{r figure-cdiff-bars-party, echo = FALSE, eval = have_votes, fig.height = max(5, 0.9 * n_districts), fig.width = 11, fig.cap = paste0("Cdiff by district for the minority party vote, by reference shape, ", params$state, ".")}
+```{r figure-cdiff-bars-party, echo = FALSE, eval = have_votes, fig.height = max(5, 0.9 * n_districts), fig.width = 11, fig.cap = paste0("ΔC by district for the ", fp_disp, " vote, by reference shape, ", params$state, ".")}
 make_cdiff_bars(c("chDiffV", "mbcDiffV", "cpcDiffV"),
-                paste0("Cdiff by district, minority party vote (", params$state, ")"))
+                paste0("ΔC by district, focal party vote (", params$state, ")"))
 ```
 
-```{r figure-cdiff-bars-race, echo = FALSE, fig.height = max(5, 0.9 * n_districts), fig.width = 11, fig.cap = paste0("Cdiff by district for the ", params$group, " population, by reference shape, ", params$state, ".")}
+```{r figure-cdiff-bars-race, echo = FALSE, fig.height = max(5, 0.9 * n_districts), fig.width = 11, fig.cap = paste0("ΔC by district for the ", params$group, " ", basis_word, ", by reference shape, ", params$state, ".")}
 make_cdiff_bars(c("chDiff", "mbcDiff", "cpcDiff"),
-                paste0("Cdiff by district, ", params$group, " population (", params$state, ")"))
+                paste0("ΔC by district, ", params$group, " population (", params$state, ")"))
 ```
 
-### 5.4.2 Cdiff choropleth map by district
+### 5.4.2 ΔC choropleth map by district
 
-`r if (have_votes) "Figures \\@ref(fig:figure-cdiff-map-party) and \\@ref(fig:figure-cdiff-map-race)" else "Figure \\@ref(fig:figure-cdiff-map-race)"` draw the same Cdiff on the district map, so the spatial pattern is visible. Each district is
-shaded by its Cdiff, red for packed and blue for cracked, with each district number labeled. The
+`r if (have_votes) "Figures \\@ref(fig:figure-cdiff-map-party) and \\@ref(fig:figure-cdiff-map-race)" else "Figure \\@ref(fig:figure-cdiff-map-race)"` draw the same ΔC on the district map, so the spatial pattern is visible. Each district is
+shaded by its ΔC, red for concentration and blue for dilution, with each district number labeled. The
 three panels are the three reference shapes, side by side, in the same order as the bar chart. `r if (have_votes) "As with the bars, the partisan map comes first and the racial map below it." else "Only the racial map is shown, because no precinct data is loaded."` To read it, find a district by its number and compare
-its color across the three panels. A district that is red in all three panels is robustly packed,
-and one that is blue in all three is robustly cracked. A district that changes color between
+its color across the three panels. A district that is red in all three panels is robustly concentrated,
+and one that is blue in all three is robustly diluted. A district that changes color between
 panels is a case where the choice of reference shape matters.
 
 ```{r cdiff-map-setup, include = FALSE}
@@ -1376,27 +1791,35 @@ make_cdiff_map <- function(dcols, ttl) {
   lim <- max(abs(m$Cdiff), na.rm = TRUE)   # symmetric color range
   ggplot(m) +
     geom_sf(aes(fill = Cdiff), color = "grey30", linewidth = 0.2) +
-    geom_sf_text(aes(label = DISTRICT), size = 5, fontface = "bold", color = "grey10") +
+    # district number on top, signed ΔC below it: a positive (red) value is
+    # concentration and a negative (blue) value is dilution, read per district and panel
+    geom_sf_text(aes(label = paste0(DISTRICT, "\n",
+                     ifelse(is.na(Cdiff), "", sprintf("%+.1f", Cdiff)))),
+                 size = 3.8, fontface = "bold", color = "grey10", lineheight = 0.8) +
     scale_fill_gradient2(low = "#6EA6C3", mid = "white", high = "#DC6D85",
                          midpoint = 0, limits = c(-lim, lim),
                          breaks  = c(-lim, 0, lim),
-                         labels  = c("Cracking", "0", "Packing"),
-                         name = "Cdiff") +
+                         labels  = c("Dilution", "0", "Concentration"),
+                         name = "ΔC") +
     facet_wrap(~ reference, ncol = 3, labeller = as_labeller(ref_labels)) +
+    # horizontal colorbar along the bottom, so the "Dilution"/"Concentration" end
+    # labels are not clipped in wide, short states
+    guides(fill = guide_colorbar(title.position = "left", title.vjust = 0.9,
+                                 barwidth = unit(9, "cm"), barheight = unit(0.5, "cm"))) +
     theme_void(base_size = 18) +
     theme(strip.text = ggtext::element_markdown(size = 20, face = "bold", margin = margin(b = 6)),
+          legend.position = "bottom",
           legend.title = element_text(size = 18),
-          legend.text = element_text(size = 16),
-          legend.key.width = unit(1.4, "cm"))
+          legend.text = element_text(size = 16))
 }
 ```
 
-```{r figure-cdiff-map-party, echo = FALSE, eval = have_votes, fig.width = 12, fig.height = 4 * map_asp + 0.9, fig.cap = paste0("Cdiff mapped for the minority party vote, by reference shape, ", params$state, ".")}
+```{r figure-cdiff-map-party, echo = FALSE, eval = have_votes, fig.width = 12, fig.height = 4 * map_asp + 2.0, fig.cap = paste0("ΔC mapped for the ", fp_disp, " vote, by reference shape, ", params$state, ".")}
 make_cdiff_map(c("chDiffV", "mbcDiffV", "cpcDiffV"),
-               paste0("Cdiff by district, minority party vote (", params$state, ")"))
+               paste0("ΔC by district, focal party vote (", params$state, ")"))
 ```
 
-```{r figure-cdiff-map-race, echo = FALSE, fig.width = 12, fig.height = 4 * map_asp + 0.9, fig.cap = paste0("Cdiff mapped for the ", params$group, " population, by reference shape, ", params$state, ".")}
+```{r figure-cdiff-map-race, echo = FALSE, fig.width = 12, fig.height = 4 * map_asp + 2.0, fig.cap = paste0("ΔC mapped for the ", params$group, " ", basis_word, ", by reference shape, ", params$state, ".")}
 make_cdiff_map(c("chDiff", "mbcDiff", "cpcDiff"),
-               paste0("Cdiff by district, ", params$group, " population (", params$state, ")"))
+               paste0("ΔC by district, ", params$group, " population (", params$state, ")"))
 ```
